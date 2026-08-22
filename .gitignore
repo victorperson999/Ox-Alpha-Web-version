@@ -10,5 +10,8 @@ node_modules/
 .DS_Store
 Thumbs.db
 
+# local runtime state
+sessions.json
+
 # claude code local state
 .claude/
