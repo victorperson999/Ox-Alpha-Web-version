@@ -39,8 +39,28 @@ function resolveClaudePath() {
 
 const CLAUDE_PATH = process.env.CLAUDE_BIN || resolveClaudePath();
 
-// conversationId (ours, sent to the browser) -> claude session uuid
-const conversations = new Map();
+// conversationId (ours, sent to the browser) -> claude session uuid.
+// Persisted to sessions.json so reopened chats keep their memory across
+// server restarts.
+const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
+
+function loadSessions() {
+  try {
+    return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+const sessions = loadSessions();
+
+function saveSessions() {
+  try {
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+  } catch (err) {
+    console.error(`[ox-chat] could not save sessions: ${err.message}`);
+  }
+}
 
 /**
  * Spawn `claude -p`, write `message` to stdin, resolve with the reply text.
@@ -105,21 +125,23 @@ function runClaude(message, opts) {
  * session automatically.
  */
 async function handleChatTurn(conversationId, message) {
-  const existing = conversations.get(conversationId);
+  const existing = sessions[conversationId];
 
   if (existing) {
     try {
       return await runClaude(message, { mode: 'resume', sessionId: existing });
     } catch (err) {
       console.error(`[ox-chat] resume failed (${conversationId}), starting fresh: ${err.message}`);
-      conversations.delete(conversationId);
+      delete sessions[conversationId];
+      saveSessions();
       // fall through and start a new session below
     }
   }
 
   const sessionId = crypto.randomUUID();
   const reply = await runClaude(message, { mode: 'new', sessionId });
-  conversations.set(conversationId, sessionId);
+  sessions[conversationId] = sessionId;
+  saveSessions();
   return reply;
 }
 
@@ -185,6 +207,8 @@ function serveStatic(req, res) {
     }
     res.writeHead(200, {
       'Content-Type': MIME[path.extname(filePath).toLowerCase()] || 'application/octet-stream',
+      // dev server: always serve fresh assets, never a stale cached copy
+      'Cache-Control': 'no-store',
     });
     res.end(data);
   });
@@ -230,8 +254,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
+  // Startup banner: the single source of truth for where messages will go.
+  // The spawned claude CLI inherits these env vars from THIS terminal.
+  const backend = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com (your normal Anthropic login)';
+  const model = process.env.ANTHROPIC_MODEL || '(CLI default)';
+
   console.log(`[ox-chat] listening on http://${HOST}:${PORT}`);
   console.log(`[ox-chat] claude binary: ${CLAUDE_PATH || 'NOT FOUND — set CLAUDE_BIN'}`);
+  console.log(`[ox-chat] backend: ${backend}`);
+  console.log(`[ox-chat] model:   ${model}`);
 });
 
 server.on('error', (err) => {
