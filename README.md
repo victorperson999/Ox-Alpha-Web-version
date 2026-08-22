@@ -11,7 +11,7 @@ variables.
 ## Run
 
 ```powershell
-cd C:\Users\Lenovo\Documents\temp\ox-chat
+cd path\to\ox-chat   # wherever you cloned this repo
 node server.js
 ```
 
