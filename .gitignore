@@ -1,0 +1,14 @@
+# dependencies (none yet — future-proofing)
+node_modules/
+
+# local secrets
+.env
+.env.*
+
+# logs & OS noise
+*.log
+.DS_Store
+Thumbs.db
+
+# claude code local state
+.claude/
