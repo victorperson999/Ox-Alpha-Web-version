@@ -1,6 +1,6 @@
 # Ox Chat
 
-A minimal ChatGPT-style web UI for your locally installed **Claude Code CLI**.
+A minimal web UI for your locally installed **Claude Code CLI** to use the new Ox Alpha AI model.
 Zero npm dependencies — Node built-ins only.
 
 Backend-agnostic by design: it talks to whatever backend your `claude` CLI is
