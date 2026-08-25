@@ -15,6 +15,7 @@ const els = {
   accName: $('accName'),
   avatar: $('avatar'),
   hero: $('hero'),
+  starters: $('starters'),
   topbarTitle: $('topbarTitle'),
   jumpBtn: $('jumpBtn'),
   modelSelect: $('modelSelect'),
@@ -23,6 +24,8 @@ const els = {
   input: $('input'),
   sendBtn: $('send'),
 };
+
+const fmt = window.oxFormat;
 
 /* ------------------------------------------------------------ state */
 
@@ -41,6 +44,10 @@ let defaultModel = null; // whatever .env resolved to, from /api/config
 let customModels = loadJSON(MODEL_LIST_KEY, []);
 let chosenModel = localStorage.getItem(MODEL_KEY) || ''; // '' = use the server default
 
+// The raw Markdown behind each rendered reply, for "copy reply". Keyed weakly
+// so removing a bubble drops its text with it.
+const rawText = new WeakMap();
+
 function loadJSON(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
@@ -53,41 +60,62 @@ function loadJSON(key, fallback) {
 function saveJSON(key, value) {
   try {
     localStorage.setItem(key, JSON.stringify(value));
-  } catch { /* private mode etc. — the app still works, it just won't remember */ }
+    return true;
+  } catch {
+    // Quota exhausted or private mode: the chat still works, history doesn't save.
+    return false;
+  }
 }
 
-const persist = () => saveJSON(STORE_KEY, chats);
+let warnedAboutStorage = false;
+
+function persist() {
+  if (saveJSON(STORE_KEY, chats) || warnedAboutStorage) return;
+  warnedAboutStorage = true;
+  addBubble('error', '⚠️ Browser storage is full — this chat works, but history is no longer being saved. Export or delete some chats.');
+}
+
+const displayName = () => localStorage.getItem(NAME_KEY) || 'You';
+const modelLabel = () => chosenModel || defaultModel || 'Assistant';
 
 /* --------------------------------------------------------- sidebar */
 
 function renderList() {
-  const q = els.searchInput.value.trim().toLowerCase();
-  const items = Object.values(chats)
-    .filter((c) => !q || c.title.toLowerCase().includes(q))
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const query = els.searchInput.value.trim();
+  const results = fmt.searchChats(chats, query);
 
   els.chatList.innerHTML = '';
 
-  if (!items.length) {
+  if (!results.length) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = q ? 'No matching chats' : 'No chats yet';
+    empty.textContent = query ? 'No matching chats' : 'No chats yet';
     els.chatList.appendChild(empty);
     return;
   }
 
-  for (const c of items) {
-    // A row, not a single button: it holds its own rename/delete controls, and
-    // a button cannot legally nest inside another button.
+  for (const { chat: c, title: titleMatched, hits } of results) {
     const row = document.createElement('div');
     row.className = 'chat-item' + (c.id === currentChatId ? ' active' : '');
 
     const open = document.createElement('button');
     open.type = 'button';
     open.className = 'chat-open';
-    open.textContent = c.title;
     open.title = c.title;
     open.addEventListener('click', () => openChat(c.id));
+
+    const label = document.createElement('span');
+    label.className = 'chat-title';
+    label.textContent = c.title;
+    open.appendChild(label);
+
+    // Say why a chat surfaced when the query isn't in its title.
+    if (query && !titleMatched && hits) {
+      const badge = document.createElement('span');
+      badge.className = 'chat-hits';
+      badge.textContent = `${hits} match${hits === 1 ? '' : 'es'}`;
+      open.appendChild(badge);
+    }
 
     const actions = document.createElement('div');
     actions.className = 'chat-actions';
@@ -160,20 +188,34 @@ function openChat(id) {
   conversationId = c.conversationId || null;
 
   els.chat.innerHTML = '';
-  for (const m of c.messages) {
+  const lastIndex = c.messages.length - 1;
+
+  c.messages.forEach((m, i) => {
     if (m.role === 'user') {
-      addBubble('user', m.text);
+      const bubble = addBubble('user', m.text);
+      addMeta(bubble, { role: 'user', at: m.at });
     } else {
       const bubble = addBubble('assistant', '');
       renderAssistant(bubble, m.text, true);
-      if (m.usage) addMeta(bubble, m.usage);
+      addMeta(bubble, {
+        role: 'assistant',
+        at: m.at,
+        usage: m.usage,
+        actions: assistantActions(i === lastIndex),
+      });
     }
-  }
+  });
+
   els.hero.classList.add('gone');
   els.topbarTitle.textContent = c.title;
   closeMobileNav();
   renderList();
-  scrollToEnd();
+
+  // Opening a chat from a search result should show you where the hits are.
+  const query = els.searchInput.value.trim();
+  if (query) highlightMatches(els.chat, query);
+
+  scrollToEnd(false);
 }
 
 function newChat() {
@@ -184,10 +226,11 @@ function newChat() {
   els.topbarTitle.textContent = '';
   closeMobileNav();
   renderList();
+  updateJumpButton();
   els.input.focus();
 }
 
-/* ------------------------------------------------------------ chat */
+/* ---------------------------------------------------------- scroll */
 
 // How close to the bottom still counts as "following along".
 const FOLLOW_SLACK_PX = 80;
@@ -238,6 +281,8 @@ els.jumpBtn.addEventListener('click', () => {
   els.input.focus();
 });
 
+/* ------------------------------------------------------------ chat */
+
 function addBubble(kind, text) {
   const el = document.createElement('div');
   el.className = `msg ${kind}`;
@@ -255,6 +300,7 @@ function addBubble(kind, text) {
 function renderAssistant(el, text, withCopyButtons) {
   el.classList.add('md');
   el.innerHTML = window.renderMarkdown(text);
+  rawText.set(el, text);
   if (withCopyButtons) addCopyButtons(el);
 }
 
@@ -269,15 +315,53 @@ function addCopyButtons(root) {
   }
 }
 
-function addMeta(bubble, usage) {
-  if (!usage) return;
-  const m = document.createElement('div');
-  m.className = 'msg-meta';
-  // Tokens only: the CLI's cost figure uses Anthropic pricing and is wrong
-  // for any other backend.
-  m.textContent = `↑ ${usage.input.toLocaleString()} in · ↓ ${usage.output.toLocaleString()} out`;
-  bubble.insertAdjacentElement('afterend', m);
-  return m;
+const assistantActions = (isLast) => [
+  { act: 'copy-reply', label: 'Copy', title: 'Copy this reply as Markdown' },
+  ...(isLast
+    ? [{
+        act: 'ask-again',
+        label: 'Ask again',
+        // Honest label: the CLI session is append-only, so this adds a new turn
+        // rather than replacing the previous answer.
+        title: 'Send the same question again as a new turn (it does not replace this answer)',
+      }]
+    : []),
+];
+
+/** The row under a message: timestamp, token counts, and its actions. */
+function addMeta(bubble, { role, at, usage, actions = [] }) {
+  const bits = [];
+  const when = fmt.formatTime(at);
+  if (when) bits.push(when);
+  if (usage) {
+    // Tokens only: the CLI's cost figure uses Anthropic pricing and is wrong
+    // for any other backend.
+    bits.push(`↑ ${usage.input.toLocaleString()} · ↓ ${usage.output.toLocaleString()}`);
+  }
+  if (!bits.length && !actions.length) return null;
+
+  const row = document.createElement('div');
+  row.className = `msg-meta ${role}`;
+
+  if (bits.length) {
+    const text = document.createElement('span');
+    text.className = 'meta-text';
+    text.textContent = bits.join('  ·  ');
+    row.appendChild(text);
+  }
+
+  for (const a of actions) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'meta-act';
+    btn.dataset.act = a.act;
+    btn.textContent = a.label;
+    btn.title = a.title || a.label;
+    row.appendChild(btn);
+  }
+
+  bubble.insertAdjacentElement('afterend', row);
+  return row;
 }
 
 function addTyping() {
@@ -287,6 +371,46 @@ function addTyping() {
   els.chat.appendChild(el);
   scrollToEnd();
   return el;
+}
+
+/** Wrap query matches in <mark>, walking text nodes so markup stays intact. */
+function highlightMatches(root, query) {
+  const needle = String(query || '').trim().toLowerCase();
+  if (!needle) return 0;
+
+  const LIMIT = 300; // a pathological query shouldn't lock the page up
+  let count = 0;
+
+  const visit = (node) => {
+    if (count >= LIMIT) return;
+    for (const child of [...node.childNodes]) {
+      if (child.nodeType === 3) {
+        const text = child.nodeValue;
+        const lower = text.toLowerCase();
+        if (!lower.includes(needle)) continue;
+
+        const frag = document.createDocumentFragment();
+        let from = 0;
+        for (;;) {
+          const at = lower.indexOf(needle, from);
+          if (at === -1 || count >= LIMIT) break;
+          if (at > from) frag.appendChild(document.createTextNode(text.slice(from, at)));
+          const mark = document.createElement('mark');
+          mark.textContent = text.slice(at, at + needle.length);
+          frag.appendChild(mark);
+          from = at + needle.length;
+          count++;
+        }
+        if (from < text.length) frag.appendChild(document.createTextNode(text.slice(from)));
+        child.replaceWith(frag);
+      } else if (child.nodeType === 1 && child.tagName !== 'MARK' && child.tagName !== 'BUTTON') {
+        visit(child);
+      }
+    }
+  };
+
+  visit(root);
+  return count;
 }
 
 function autosize() {
@@ -342,14 +466,22 @@ function stop() {
   abort?.abort();
 }
 
-async function send() {
-  const text = els.input.value.trim();
+/**
+ * Run one turn.
+ *   text      what to send; defaults to whatever is in the composer
+ *   echoUser  false when the user's bubble is already on screen (a retry)
+ */
+async function send(text = els.input.value.trim(), { echoUser = true } = {}) {
   if (!text || busy) return;
 
   els.hero.classList.add('gone');
-  addBubble('user', text);
-  els.input.value = '';
-  autosize();
+  const sentAt = Date.now();
+  if (echoUser) {
+    const userBubble = addBubble('user', text);
+    addMeta(userBubble, { role: 'user', at: sentAt });
+    els.input.value = '';
+    autosize();
+  }
 
   setBusy(true);
   const typing = addTyping();
@@ -435,13 +567,16 @@ async function send() {
     renderAssistant(bubble, reply, true); // final paint, now with copy buttons
     if (stopped) bubble.classList.add('stopped');
     if (!reply) bubble.remove();
-    else if (usage) addMeta(bubble, usage);
   }
 
   // Keep whatever arrived: a stopped or half-failed turn is still history the
   // CLI session remembers, so the transcript must match it.
-  if (reply) rememberTurn(text, reply, usage);
-  if (failed) addBubble('error', '⚠️ ' + failed);
+  if (reply) {
+    const at = Date.now();
+    rememberTurn(text, reply, usage, sentAt, at);
+    addMeta(bubble, { role: 'assistant', at, usage, actions: assistantActions(true) });
+  }
+  if (failed) addFailure(failed, text);
 
   abort = null;
   setBusy(false);
@@ -449,47 +584,94 @@ async function send() {
   els.input.focus();
 }
 
-function rememberTurn(userText, replyText, usage) {
+/** An error bubble that can retry the exact message that failed. */
+function addFailure(message, attemptedText) {
+  const bubble = addBubble('error', '⚠️ ' + message);
+  const row = document.createElement('div');
+  row.className = 'msg-meta error';
+
+  const retry = document.createElement('button');
+  retry.type = 'button';
+  retry.className = 'meta-act';
+  retry.textContent = 'Retry';
+  retry.title = 'Send that message again';
+  retry.addEventListener('click', () => {
+    bubble.remove();
+    row.remove();
+    // The user's bubble is already on screen from the failed attempt.
+    send(attemptedText, { echoUser: false });
+  });
+
+  row.appendChild(retry);
+  bubble.insertAdjacentElement('afterend', row);
+  scrollToEnd();
+}
+
+function rememberTurn(userText, replyText, usage, sentAt, repliedAt) {
   if (!currentChatId) {
     currentChatId = crypto.randomUUID();
     chats[currentChatId] = {
       id: currentChatId,
       title: userText.slice(0, 60) + (userText.length > 60 ? '…' : ''),
       conversationId: null,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: sentAt,
+      updatedAt: repliedAt,
       messages: [],
     };
   }
   const c = chats[currentChatId];
   c.conversationId = conversationId;
   c.messages.push(
-    { role: 'user', text: userText },
-    { role: 'assistant', text: replyText, usage: usage || undefined }
+    { role: 'user', text: userText, at: sentAt },
+    { role: 'assistant', text: replyText, usage: usage || undefined, at: repliedAt }
   );
-  c.updatedAt = Date.now();
+  c.updatedAt = repliedAt;
   persist();
   els.topbarTitle.textContent = c.title;
   renderList();
 }
 
-/* ------------------------------------------------------ copy buttons */
+/* ------------------------------------------------- message actions */
 
 els.chat.addEventListener('click', async (e) => {
-  const btn = e.target.closest('.copy-btn');
-  if (!btn) return;
-  const code = btn.closest('pre')?.querySelector('code');
-  if (!code) return;
-
-  const done = (label) => {
+  const flash = (btn, label, revert = 'Copy') => {
     btn.textContent = label;
-    setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+    setTimeout(() => { btn.textContent = revert; }, 1200);
   };
-  try {
-    await navigator.clipboard.writeText(code.textContent);
-    done('Copied');
-  } catch {
-    done('Failed');
+
+  const codeBtn = e.target.closest('.copy-btn');
+  if (codeBtn) {
+    const code = codeBtn.closest('pre')?.querySelector('code');
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code.textContent);
+      flash(codeBtn, 'Copied');
+    } catch {
+      flash(codeBtn, 'Failed');
+    }
+    return;
+  }
+
+  const action = e.target.closest('.meta-act');
+  if (!action) return;
+
+  const bubble = action.closest('.msg-meta')?.previousElementSibling;
+
+  if (action.dataset.act === 'copy-reply') {
+    const text = (bubble && rawText.get(bubble)) || bubble?.textContent || '';
+    try {
+      await navigator.clipboard.writeText(text);
+      flash(action, 'Copied');
+    } catch {
+      flash(action, 'Failed');
+    }
+    return;
+  }
+
+  if (action.dataset.act === 'ask-again') {
+    const messages = chats[currentChatId]?.messages || [];
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+    if (lastUser) send(lastUser.text);
   }
 });
 
@@ -558,6 +740,30 @@ async function loadConfig() {
   renderModelOptions();
 }
 
+/* ------------------------------------------------------------ export */
+
+function exportCurrentChat() {
+  const chat = chats[currentChatId];
+  if (!chat) {
+    alert('Open a chat first — there is nothing to export yet.');
+    return;
+  }
+
+  const markdown = fmt.chatToMarkdown(chat, {
+    userName: displayName(),
+    assistantName: modelLabel(),
+  });
+
+  const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fmt.exportFilename(chat);
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 /* ---------------------------------------------------- account menu */
 
 function setMenuOpen(open) {
@@ -572,12 +778,6 @@ els.accountBtn.addEventListener('click', (e) => {
 
 document.addEventListener('click', (e) => {
   if (!els.accountMenu.hidden && !e.target.closest('.menu-wrap')) setMenuOpen(false);
-});
-
-document.addEventListener('keydown', (e) => {
-  if (e.key !== 'Escape') return;
-  setMenuOpen(false);
-  if (busy) stop();
 });
 
 els.accountMenu.addEventListener('click', async (e) => {
@@ -596,6 +796,9 @@ els.accountMenu.addEventListener('click', async (e) => {
     case 'help':
       $('helpDlg').showModal();
       break;
+    case 'export':
+      exportCurrentChat();
+      break;
     case 'clear': {
       if (!confirm('Delete all saved chats? This cannot be undone.')) break;
       const ids = Object.values(chats).map((c) => c.conversationId).filter(Boolean);
@@ -612,7 +815,7 @@ els.accountMenu.addEventListener('click', async (e) => {
 /* -------------------------------------------------- settings/name */
 
 function applyName() {
-  const name = localStorage.getItem(NAME_KEY) || 'You';
+  const name = displayName();
   els.accName.textContent = name;
   els.avatar.textContent = (name.trim()[0] || 'Y').toUpperCase();
   $('profName').textContent = name;
@@ -648,6 +851,49 @@ els.burger.addEventListener('click', () => {
 });
 
 els.scrim.addEventListener('click', closeMobileNav);
+
+/* ------------------------------------------------ keyboard shortcuts */
+
+document.addEventListener('keydown', (e) => {
+  const mod = e.ctrlKey || e.metaKey;
+
+  if (e.key === 'Escape') {
+    setMenuOpen(false);
+    if (busy) stop();
+    return;
+  }
+
+  // Ctrl/Cmd+K — jump to search.
+  if (mod && !e.shiftKey && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    els.searchInput.focus();
+    els.searchInput.select?.();
+    return;
+  }
+
+  // Alt+N — new chat. Alt rather than Ctrl, which the browser claims.
+  if (e.altKey && !mod && e.key.toLowerCase() === 'n') {
+    e.preventDefault();
+    newChat();
+    return;
+  }
+
+  // Ctrl/Cmd+/ — shortcut reference.
+  if (mod && e.key === '/') {
+    e.preventDefault();
+    $('helpDlg').showModal();
+  }
+});
+
+/* ---------------------------------------------------- prompt starters */
+
+els.starters?.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-prompt]');
+  if (!btn) return;
+  els.input.value = btn.dataset.prompt;
+  autosize();
+  els.input.focus();
+});
 
 /* ------------------------------------------------------------ init */
 

@@ -37,6 +37,7 @@
             <button type="button" role="menuitem" data-action="settings">&#9881;&#65039;&nbsp; Settings</button>
             <button type="button" role="menuitem" data-action="profile">&#128100;&nbsp; Profile</button>
             <button type="button" role="menuitem" data-action="help">&#10067;&nbsp; Help</button>
+            <button type="button" role="menuitem" data-action="export">&#11015;&#65039;&nbsp; Export chat</button>
             <hr />
             <button type="button" role="menuitem" class="danger" data-action="clear">&#128465;&#65039;&nbsp; Clear all chats</button>
           </div>
@@ -61,6 +62,17 @@
           This is a tiny local wrapper &mdash; your prompts go to the model behind
           your terminal, straight from the browser.
         </p>
+
+        <div class="starters" id="starters">
+          <button type="button" data-prompt="Summarise what this project does and how it is structured.">
+            Summarise this project</button>
+          <button type="button" data-prompt="Review my recent changes for bugs.">
+            Review recent changes</button>
+          <button type="button" data-prompt="Explain this error and how to fix it:&#10;&#10;">
+            Explain an error</button>
+          <button type="button" data-prompt="Draft a commit message for my current changes.">
+            Draft a commit message</button>
+        </div>
       </header>
 
       <section class="chat" id="chat" aria-live="polite"></section>
@@ -106,20 +118,34 @@
     <ul class="help-list">
       <li><strong>New chat</strong> starts a fresh conversation with a clean context.</li>
       <li>Click any chat in the sidebar to reopen it with its memory intact.</li>
-      <li><strong>Search</strong> filters your saved chats by title.</li>
+      <li><strong>Search</strong> looks through chat titles <em>and</em> message text &mdash;
+        matches are highlighted when you open the chat.</li>
       <li>While a reply streams, the send button becomes <strong>stop</strong> &mdash;
         or press <kbd>Esc</kbd>. Whatever arrived so far is kept.</li>
       <li>Hover a chat in the sidebar to <strong>rename</strong> or <strong>delete</strong> it.
         Deleting also drops the session on disk.</li>
       <li>Hover a code block to copy it. The <strong>model</strong> dropdown overrides
         <code>.env</code> for new messages.</li>
+      <li><strong>Ask again</strong> re-sends your last question as a new turn. It adds
+        to the conversation rather than replacing the previous answer.</li>
       <li>Everything is stored locally: chats in your browser, sessions on disk.</li>
+    </ul>
+
+    <h4>Shortcuts</h4>
+    <ul class="help-list keys">
+      <li><kbd>Enter</kbd> send &middot; <kbd>Shift</kbd>+<kbd>Enter</kbd> newline</li>
+      <li><kbd>Esc</kbd> stop a streaming reply</li>
+      <li><kbd>Ctrl</kbd>+<kbd>K</kbd> jump to search</li>
+      <li><kbd>Alt</kbd>+<kbd>N</kbd> new chat</li>
+      <li><kbd>Ctrl</kbd>+<kbd>/</kbd> this dialog</li>
     </ul>
     <div class="dlg-actions">
       <button class="btn primary" data-close type="button">Got it</button>
     </div>
   </dialog>
 
+  <script src="/format.js"></script>
+  <script src="/highlight.js"></script>
   <script src="/markdown.js"></script>
   <script src="/app.js"></script>
 </body>
