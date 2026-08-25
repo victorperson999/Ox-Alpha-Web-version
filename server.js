@@ -24,6 +24,14 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const HEARTBEAT_MS = 15 * 1000;
 
+/* --------------------------------------------------------- attachments */
+
+const MAX_ATTACHMENTS = 6;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;   // decoded, per image
+const MAX_TEXT_CHARS = 256 * 1024;         // per inlined text file
+const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+
 /* ----------------------------------------------------------------- .env */
 
 // The backend variables the spawned CLI cares about. Listed explicitly so an
@@ -128,6 +136,11 @@ function buildClaudeEnv(processEnv = process.env, fileEnv = dotEnv) {
 const CLAUDE_ENV = buildClaudeEnv();
 const PORT = Number(conf('PORT', 3000));
 
+// Base64 inflates by about a third, so the body cap has to clear the per-image
+// cap with room to spare. Overridable so tests can trip it cheaply.
+// Declared here, below conf(), rather than with the other attachment limits.
+const MAX_BODY_BYTES = Number(conf('OXCHAT_MAX_BODY_BYTES', 32 * 1024 * 1024));
+
 /* ------------------------------------------------------------ claude CLI */
 
 function resolveClaudePath() {
@@ -166,6 +179,101 @@ function saveSessions() {
   } catch (err) {
     console.error(`[ox-chat] could not save sessions: ${err.message}`);
   }
+}
+
+/** Longest fence in the body, so inlined content can never break out. */
+function fenceFor(body) {
+  const runs = String(body).match(/^`{3,}/gm);
+  return '`'.repeat(runs ? Math.max(...runs.map((r) => r.length)) + 1 : 3);
+}
+
+const langFor = (name) => (String(name).match(/\.([A-Za-z0-9]+)$/) || [, ''])[1].toLowerCase();
+
+/**
+ * Validate and normalise the attachment list from a request.
+ * Returns { ok: true, attachments } or { ok: false, error }.
+ */
+function normalizeAttachments(input) {
+  if (input === undefined || input === null) return { ok: true, attachments: [] };
+  if (!Array.isArray(input)) return { ok: false, error: 'Field "attachments" must be an array.' };
+  if (input.length > MAX_ATTACHMENTS) {
+    return { ok: false, error: `At most ${MAX_ATTACHMENTS} attachments per message.` };
+  }
+
+  const out = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object') {
+      return { ok: false, error: 'Each attachment must be an object.' };
+    }
+    const name = typeof raw.name === 'string' && raw.name.trim()
+      ? raw.name.trim().slice(0, 200)
+      : 'attachment';
+
+    if (raw.kind === 'image') {
+      if (!IMAGE_TYPES.has(raw.mediaType)) {
+        return { ok: false, error: `"${name}": unsupported image type. Use PNG, JPEG, GIF or WebP.` };
+      }
+      const data = typeof raw.data === 'string' ? raw.data.replace(/\s+/g, '') : '';
+      if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data) || data.length % 4 !== 0) {
+        return { ok: false, error: `"${name}" is not valid base64 image data.` };
+      }
+      const bytes = Math.floor((data.length * 3) / 4);
+      if (bytes > MAX_IMAGE_BYTES) {
+        const mb = (bytes / 1024 / 1024).toFixed(1);
+        return { ok: false, error: `"${name}" is ${mb}MB; the limit is 5MB per image.` };
+      }
+      out.push({ kind: 'image', name, mediaType: raw.mediaType, data });
+      continue;
+    }
+
+    if (raw.kind === 'text') {
+      if (typeof raw.text !== 'string') {
+        return { ok: false, error: `"${name}" has no text content.` };
+      }
+      if (raw.text.length > MAX_TEXT_CHARS) {
+        return { ok: false, error: `"${name}" is too long to inline (limit ${MAX_TEXT_CHARS / 1024}KB).` };
+      }
+      out.push({ kind: 'text', name, text: raw.text });
+      continue;
+    }
+
+    return { ok: false, error: `Unknown attachment kind: ${JSON.stringify(raw.kind)}` };
+  }
+
+  return { ok: true, attachments: out };
+}
+
+/**
+ * Compose the CLI's stream-json user message.
+ *
+ * Text files are inlined into the prompt as fenced blocks — the model reads
+ * them as text. Images become image content blocks the model sees directly;
+ * this wrapper never interprets them. Images lead, which is what Anthropic
+ * recommends when a prompt mixes both.
+ */
+function buildUserContent(message, attachments = []) {
+  const content = [];
+  let text = String(message ?? '');
+
+  for (const a of attachments.filter((x) => x.kind === 'image')) {
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: a.mediaType, data: a.data },
+    });
+  }
+
+  for (const a of attachments.filter((x) => x.kind === 'text')) {
+    const fence = fenceFor(a.text);
+    text += `\n\nAttached file: ${a.name}\n${fence}${langFor(a.name)}\n${a.text}\n${fence}`;
+  }
+
+  const names = attachments.filter((x) => x.kind === 'image').map((x) => x.name);
+  if (names.length) {
+    text += `\n\n(${names.length} image${names.length === 1 ? '' : 's'} attached: ${names.join(', ')})`;
+  }
+
+  content.push({ type: 'text', text });
+  return { content, text };
 }
 
 /**
@@ -251,6 +359,8 @@ function streamClaude(message, opts) {
 
     const args = [
       '-p',
+      // Structured input carries image content blocks; plain stdin cannot.
+      '--input-format', 'stream-json',
       '--output-format', 'stream-json',
       '--include-partial-messages',
       // the CLI rejects stream-json under -p without this
@@ -326,8 +436,10 @@ function streamClaude(message, opts) {
       reject(new Error(stderr.trim() || `claude exited with code ${code}`));
     });
 
-    // Prompt goes over stdin: immune to Windows quoting/newline issues.
-    child.stdin.write(message);
+    // One JSON line over stdin: immune to Windows quoting, and the only way
+    // to attach images.
+    const { content } = buildUserContent(message, opts.attachments);
+    child.stdin.write(JSON.stringify({ type: 'user', message: { role: 'user', content } }) + '\n');
     child.stdin.end();
   });
 }
@@ -421,7 +533,7 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-function readBody(req, limit = 1024 * 1024) {
+function readBody(req, limit = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
@@ -493,9 +605,6 @@ async function handleChatRequest(req, res) {
   }
 
   const message = typeof payload.message === 'string' ? payload.message.trim() : '';
-  if (!message) {
-    return sendJson(res, 400, { error: 'Field "message" is required.' });
-  }
 
   const conversationId =
     typeof payload.conversationId === 'string' && payload.conversationId.length <= 64
@@ -508,7 +617,21 @@ async function handleChatRequest(req, res) {
       ? payload.model
       : null;
 
-  console.log(`[ox-chat] conv=${conversationId.slice(0, 8)} prompt: ${message.slice(0, 80)}${message.length > 80 ? '…' : ''}`);
+  const checked = normalizeAttachments(payload.attachments);
+  if (!checked.ok) return sendJson(res, 400, { error: checked.error });
+  const attachments = checked.attachments;
+
+  // A screenshot with no caption is a legitimate turn, so only demand text
+  // when nothing at all was attached.
+  if (!message && !attachments.length) {
+    return sendJson(res, 400, { error: 'Field "message" is required.' });
+  }
+
+
+  const attachNote = attachments.length
+    ? ` [+${attachments.length} attachment${attachments.length === 1 ? '' : 's'}]`
+    : '';
+  console.log(`[ox-chat] conv=${conversationId.slice(0, 8)}${attachNote} prompt: ${message.slice(0, 80)}${message.length > 80 ? '…' : ''}`);
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -539,6 +662,7 @@ async function handleChatRequest(req, res) {
     const out = await serialize(conversationId, () =>
       handleChatTurn(conversationId, message, {
         model,
+        attachments,
         signal: ac.signal,
         onInit: () => send('session', { conversationId }),
         onDelta: (text) => {
@@ -649,6 +773,8 @@ if (require.main === module) {
 module.exports = {
   server,
   createStreamParser,
+  normalizeAttachments,
+  buildUserContent,
   loadDotEnv,
   buildClaudeEnv,
   tokenSummary,

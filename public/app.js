@@ -23,9 +23,14 @@ const els = {
   composer: $('composer'),
   input: $('input'),
   sendBtn: $('send'),
+  attachBtn: $('attachBtn'),
+  fileInput: $('fileInput'),
+  attachTray: $('attachTray'),
+  dropOverlay: $('dropOverlay'),
 };
 
 const fmt = window.oxFormat;
+const files = window.oxAttachments;
 
 /* ------------------------------------------------------------ state */
 
@@ -43,6 +48,10 @@ let abort = null; // AbortController for the in-flight turn
 let defaultModel = null; // whatever .env resolved to, from /api/config
 let customModels = loadJSON(MODEL_LIST_KEY, []);
 let chosenModel = localStorage.getItem(MODEL_KEY) || ''; // '' = use the server default
+
+const MAX_ATTACHMENTS = 6; // matches the server
+
+let pending = []; // attachments staged for the next message
 
 // The raw Markdown behind each rendered reply, for "copy reply". Keyed weakly
 // so removing a bubble drops its text with it.
@@ -193,7 +202,8 @@ function openChat(id) {
   c.messages.forEach((m, i) => {
     if (m.role === 'user') {
       const bubble = addBubble('user', m.text);
-      addMeta(bubble, { role: 'user', at: m.at });
+      const anchor = m.attachments?.length ? addAttachmentStrip(bubble, m.attachments) : bubble;
+      addMeta(anchor, { role: 'user', at: m.at });
     } else {
       const bubble = addBubble('assistant', '');
       renderAssistant(bubble, m.text, true);
@@ -228,6 +238,103 @@ function newChat() {
   renderList();
   updateJumpButton();
   els.input.focus();
+}
+
+/* ------------------------------------------------------- attachments */
+
+function renderTray() {
+  els.attachTray.innerHTML = '';
+  els.attachTray.hidden = !pending.length;
+  if (!pending.length) return;
+
+  pending.forEach((a, index) => {
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+
+    if (a.kind === 'image' && a.thumb) {
+      const img = document.createElement('img');
+      img.className = 'chip-thumb';
+      img.src = a.thumb;
+      img.alt = '';
+      chip.appendChild(img);
+    } else {
+      const icon = document.createElement('span');
+      icon.className = 'chip-icon';
+      icon.textContent = '📄';
+      chip.appendChild(icon);
+    }
+
+    const meta = document.createElement('span');
+    meta.className = 'chip-meta';
+
+    const name = document.createElement('span');
+    name.className = 'chip-name';
+    name.textContent = a.name;
+    name.title = a.name;
+
+    const sub = document.createElement('span');
+    sub.className = 'chip-sub';
+    sub.textContent = a.kind === 'image'
+      ? `${a.width}×${a.height} · ${fmt.formatBytes(a.bytes)} · ~${fmt.estimateImageTokens(a.width, a.height).toLocaleString()} tokens`
+      : fmt.formatBytes(a.bytes);
+
+    meta.append(name, sub);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'chip-remove';
+    remove.innerHTML = '&#10005;';
+    remove.title = `Remove ${a.name}`;
+    remove.setAttribute('aria-label', `Remove ${a.name}`);
+    remove.addEventListener('click', () => {
+      pending.splice(index, 1);
+      renderTray();
+    });
+
+    chip.append(meta, remove);
+    els.attachTray.appendChild(chip);
+  });
+}
+
+async function addFiles(list) {
+  for (const file of list) {
+    if (pending.length >= MAX_ATTACHMENTS) {
+      addBubble('error', `⚠️ At most ${MAX_ATTACHMENTS} attachments per message.`);
+      break;
+    }
+    try {
+      pending.push(await files.prepare(file));
+      renderTray();
+    } catch (err) {
+      addBubble('error', '⚠️ ' + (err.message || 'That file could not be attached.'));
+    }
+  }
+}
+
+/** The row of attachment chips shown under a sent message. */
+function addAttachmentStrip(after, attachments) {
+  const strip = document.createElement('div');
+  strip.className = 'msg-attachments';
+
+  for (const a of attachments) {
+    if (a.kind === 'image' && a.thumb) {
+      const img = document.createElement('img');
+      img.className = 'att-thumb';
+      img.src = a.thumb;
+      img.alt = a.name;
+      img.title = a.name;
+      strip.appendChild(img);
+      continue;
+    }
+    const tag = document.createElement('span');
+    tag.className = 'att-file';
+    tag.textContent = `📄 ${a.name}`;
+    tag.title = a.name;
+    strip.appendChild(tag);
+  }
+
+  after.insertAdjacentElement('afterend', strip);
+  return strip;
 }
 
 /* ---------------------------------------------------------- scroll */
@@ -471,16 +578,25 @@ function stop() {
  *   text      what to send; defaults to whatever is in the composer
  *   echoUser  false when the user's bubble is already on screen (a retry)
  */
-async function send(text = els.input.value.trim(), { echoUser = true } = {}) {
-  if (!text || busy) return;
+async function send(text = els.input.value.trim(), { echoUser = true, attachments = null } = {}) {
+  // A retry replays its own attachments; otherwise we consume the tray.
+  const outgoing = attachments || pending.slice();
+  const consumingTray = !attachments;
+
+  if ((!text && !outgoing.length) || busy) return;
 
   els.hero.classList.add('gone');
   const sentAt = Date.now();
   if (echoUser) {
     const userBubble = addBubble('user', text);
-    addMeta(userBubble, { role: 'user', at: sentAt });
+    const anchor = outgoing.length ? addAttachmentStrip(userBubble, outgoing) : userBubble;
+    addMeta(anchor, { role: 'user', at: sentAt });
     els.input.value = '';
     autosize();
+  }
+  if (consumingTray) {
+    pending = [];
+    renderTray();
   }
 
   setBusy(true);
@@ -519,10 +635,13 @@ async function send(text = els.input.value.trim(), { echoUser = true } = {}) {
   };
 
   try {
+    const payload = { message: text, conversationId, model: chosenModel || undefined };
+    if (outgoing.length) payload.attachments = outgoing.map((a) => files.forRequest(a));
+
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, conversationId, model: chosenModel || undefined }),
+      body: JSON.stringify(payload),
       signal: abort.signal,
     });
 
@@ -573,10 +692,10 @@ async function send(text = els.input.value.trim(), { echoUser = true } = {}) {
   // CLI session remembers, so the transcript must match it.
   if (reply) {
     const at = Date.now();
-    rememberTurn(text, reply, usage, sentAt, at);
+    rememberTurn(text, reply, usage, sentAt, at, outgoing);
     addMeta(bubble, { role: 'assistant', at, usage, actions: assistantActions(true) });
   }
-  if (failed) addFailure(failed, text);
+  if (failed) addFailure(failed, text, outgoing);
 
   abort = null;
   setBusy(false);
@@ -585,7 +704,7 @@ async function send(text = els.input.value.trim(), { echoUser = true } = {}) {
 }
 
 /** An error bubble that can retry the exact message that failed. */
-function addFailure(message, attemptedText) {
+function addFailure(message, attemptedText, attemptedAttachments = []) {
   const bubble = addBubble('error', '⚠️ ' + message);
   const row = document.createElement('div');
   row.className = 'msg-meta error';
@@ -599,7 +718,7 @@ function addFailure(message, attemptedText) {
     bubble.remove();
     row.remove();
     // The user's bubble is already on screen from the failed attempt.
-    send(attemptedText, { echoUser: false });
+    send(attemptedText, { echoUser: false, attachments: attemptedAttachments });
   });
 
   row.appendChild(retry);
@@ -607,7 +726,7 @@ function addFailure(message, attemptedText) {
   scrollToEnd();
 }
 
-function rememberTurn(userText, replyText, usage, sentAt, repliedAt) {
+function rememberTurn(userText, replyText, usage, sentAt, repliedAt, attachments = []) {
   if (!currentChatId) {
     currentChatId = crypto.randomUUID();
     chats[currentChatId] = {
@@ -622,7 +741,14 @@ function rememberTurn(userText, replyText, usage, sentAt, repliedAt) {
   const c = chats[currentChatId];
   c.conversationId = conversationId;
   c.messages.push(
-    { role: 'user', text: userText, at: sentAt },
+    {
+      role: 'user',
+      text: userText,
+      at: sentAt,
+      // Metadata and a thumbnail only — the base64 payload would exhaust
+      // localStorage within a handful of screenshots.
+      attachments: attachments.length ? attachments.map((a) => files.forHistory(a)) : undefined,
+    },
     { role: 'assistant', text: replyText, usage: usage || undefined, at: repliedAt }
   );
   c.updatedAt = repliedAt;
@@ -885,6 +1011,54 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+/* ------------------------------------------------- attachment input */
+
+els.attachBtn.addEventListener('click', () => els.fileInput.click());
+
+els.fileInput.addEventListener('change', async () => {
+  await addFiles([...els.fileInput.files]);
+  els.fileInput.value = ''; // so picking the same file twice still fires
+});
+
+// Pasting a screenshot is the main path this exists for.
+els.input.addEventListener('paste', (e) => {
+  const dropped = files.filesFrom(e);
+  if (dropped.length) addFiles(dropped);
+  // Never preventDefault: any text on the clipboard must still paste.
+});
+
+const dragHasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+let dragDepth = 0;
+
+const showDrop = (on) => {
+  els.dropOverlay.hidden = !on;
+};
+
+document.addEventListener('dragenter', (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  showDrop(true);
+});
+
+document.addEventListener('dragover', (e) => {
+  if (dragHasFiles(e)) e.preventDefault();
+});
+
+document.addEventListener('dragleave', (e) => {
+  if (!dragHasFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) showDrop(false);
+});
+
+document.addEventListener('drop', (e) => {
+  if (!dragHasFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  showDrop(false);
+  addFiles(files.filesFrom(e));
+});
+
 /* ---------------------------------------------------- prompt starters */
 
 els.starters?.addEventListener('click', (e) => {
@@ -918,5 +1092,6 @@ els.newChatBtn.addEventListener('click', newChat);
 
 applyName();
 renderList();
+renderTray();
 loadConfig();
 els.input.focus();

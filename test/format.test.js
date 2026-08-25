@@ -9,7 +9,8 @@ const assert = require('node:assert');
 const path = require('node:path');
 
 require(path.join(__dirname, '..', 'public', 'format.js'));
-const { formatTime, formatDateTime, matchChat, searchChats, chatToMarkdown, exportFilename } =
+const { formatTime, formatDateTime, matchChat, searchChats, chatToMarkdown, exportFilename,
+  formatBytes, estimateImageTokens, scaledDimensions } =
   globalThis.oxFormat;
 
 // A fixed reference point keeps these assertions stable forever.
@@ -184,6 +185,19 @@ describe('chatToMarkdown', () => {
     assert.ok(out.includes('0 messages'));
   });
 
+  it('names attachments rather than silently dropping them', () => {
+    const out = chatToMarkdown({
+      title: 'Bug report',
+      messages: [{
+        role: 'user',
+        text: 'why does this fail?',
+        attachments: [{ kind: 'image', name: 'error.png' }, { kind: 'text', name: 'log.txt' }],
+      }],
+    }, { now: NOW });
+    assert.ok(out.includes('*Attached: error.png, log.txt*'), out);
+    assert.ok(out.includes('why does this fail?'));
+  });
+
   it('handles a missing chat object', () => {
     assert.ok(chatToMarkdown(null, { now: NOW }).includes('# Untitled chat'));
   });
@@ -210,5 +224,80 @@ describe('exportFilename', () => {
   it('falls back when the title has nothing usable', () => {
     assert.strictEqual(exportFilename({ title: '???' }, NOW), 'ox-chat-chat-20260825.md');
     assert.strictEqual(exportFilename({}, NOW), 'ox-chat-chat-20260825.md');
+  });
+});
+
+describe('formatBytes', () => {
+  it('uses bytes below a kilobyte', () => {
+    assert.strictEqual(formatBytes(0), '0 B');
+    assert.strictEqual(formatBytes(999), '999 B');
+  });
+
+  it('switches units and keeps one decimal while small', () => {
+    assert.strictEqual(formatBytes(1024), '1.0 KB');
+    assert.strictEqual(formatBytes(1536), '1.5 KB');
+    assert.strictEqual(formatBytes(1024 * 1024), '1.0 MB');
+    assert.strictEqual(formatBytes(1024 * 1024 * 1024), '1.0 GB');
+  });
+
+  it('drops the decimal once the number is large enough not to need it', () => {
+    assert.strictEqual(formatBytes(1024 * 20), '20 KB');
+    assert.strictEqual(formatBytes(1024 * 1024 * 512), '512 MB');
+  });
+
+  it('is empty for junk', () => {
+    for (const bad of [undefined, null, NaN, -1, 'x']) {
+      assert.strictEqual(formatBytes(bad), '');
+    }
+  });
+});
+
+describe('estimateImageTokens', () => {
+  it('follows the width x height / 750 guidance', () => {
+    assert.strictEqual(estimateImageTokens(750, 1), 1);
+    assert.strictEqual(estimateImageTokens(1000, 1000), Math.ceil(1000000 / 750));
+  });
+
+  it('shows why downscaling matters', () => {
+    const full = estimateImageTokens(3840, 2160);
+    const scaled = estimateImageTokens(1568, 882);
+    assert.ok(scaled < full / 4, `expected a big saving, got ${scaled} vs ${full}`);
+  });
+
+  it('is zero for nonsense dimensions', () => {
+    for (const [w, h] of [[0, 100], [100, 0], [-5, 5], [NaN, 10], [undefined, undefined]]) {
+      assert.strictEqual(estimateImageTokens(w, h), 0);
+    }
+  });
+});
+
+describe('scaledDimensions', () => {
+  it('leaves an already-small image alone', () => {
+    assert.deepStrictEqual(scaledDimensions(800, 600, 1568), { width: 800, height: 600, scaled: false });
+  });
+
+  it('fits the longest edge and preserves the aspect ratio', () => {
+    const wide = scaledDimensions(3840, 2160, 1568);
+    assert.strictEqual(wide.width, 1568);
+    assert.strictEqual(wide.scaled, true);
+    assert.ok(Math.abs(wide.width / wide.height - 3840 / 2160) < 0.01, 'aspect preserved');
+
+    const tall = scaledDimensions(1080, 2400, 1568);
+    assert.strictEqual(tall.height, 1568);
+    assert.ok(tall.width < tall.height);
+  });
+
+  it('never scales up', () => {
+    assert.deepStrictEqual(scaledDimensions(100, 100, 1568), { width: 100, height: 100, scaled: false });
+  });
+
+  it('never rounds an edge away to zero', () => {
+    const skinny = scaledDimensions(10000, 3, 1568);
+    assert.ok(skinny.height >= 1, 'a 1px edge must survive');
+  });
+
+  it('copes with junk input', () => {
+    assert.deepStrictEqual(scaledDimensions(0, 0, 1568), { width: 1, height: 1, scaled: false });
+    assert.strictEqual(scaledDimensions(100, 100, 0).scaled, false);
   });
 });

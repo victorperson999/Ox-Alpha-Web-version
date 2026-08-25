@@ -92,7 +92,16 @@
     for (const m of messages) {
       const who = m.role === 'user' ? userName : assistantName;
       const when = Number.isFinite(m.at) ? ` · ${formatDateTime(m.at)}` : '';
-      lines.push('---', '', `**${who}**${when}`, '', String(m.text ?? ''), '');
+      lines.push('---', '', `**${who}**${when}`, '');
+
+      // Named, not embedded: history keeps only thumbnails, and a transcript
+      // that silently dropped the attachment would misrepresent the turn.
+      if (m.attachments?.length) {
+        const named = m.attachments.map((a) => a.name || 'attachment').join(', ');
+        lines.push(`*Attached: ${named}*`, '');
+      }
+
+      lines.push(String(m.text ?? ''), '');
     }
 
     return lines.join('\n').replace(/\n{3,}$/, '\n');
@@ -112,6 +121,52 @@
     return `ox-chat-${slug || 'chat'}-${stamp}.md`;
   }
 
+  /* ------------------------------------------------------- attachments */
+
+  /** Human file size. Binary units, one decimal once past bytes. */
+  function formatBytes(n) {
+    if (!Number.isFinite(n) || n < 0) return '';
+    if (n < 1024) return `${Math.round(n)} B`;
+    const units = ['KB', 'MB', 'GB'];
+    let value = n / 1024;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+  }
+
+  /**
+   * Roughly what an image costs in input tokens: Anthropic's guidance is
+   * width * height / 750. Approximate by design — it is shown to set
+   * expectations, not to bill anyone.
+   */
+  function estimateImageTokens(width, height) {
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return 0;
+    if (width <= 0 || height <= 0) return 0;
+    return Math.ceil((width * height) / 750);
+  }
+
+  /**
+   * Fit an image inside `maxEdge` on its longest side, preserving aspect
+   * ratio. Never scales up — a small image is already as good as it gets.
+   */
+  function scaledDimensions(width, height, maxEdge) {
+    const w = Math.max(1, Math.round(width || 0));
+    const h = Math.max(1, Math.round(height || 0));
+    const longest = Math.max(w, h);
+    if (!Number.isFinite(maxEdge) || maxEdge <= 0 || longest <= maxEdge) {
+      return { width: w, height: h, scaled: false };
+    }
+    const ratio = maxEdge / longest;
+    return {
+      width: Math.max(1, Math.round(w * ratio)),
+      height: Math.max(1, Math.round(h * ratio)),
+      scaled: true,
+    };
+  }
+
   global.oxFormat = {
     formatTime,
     formatDateTime,
@@ -119,5 +174,8 @@
     searchChats,
     chatToMarkdown,
     exportFilename,
+    formatBytes,
+    estimateImageTokens,
+    scaledDimensions,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

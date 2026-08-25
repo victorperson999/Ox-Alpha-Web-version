@@ -131,7 +131,7 @@ before(() => {
   vm.createContext(sandbox);
   // app.js expects its helpers to already be on the window, exactly as the
   // script tags in index.html arrange.
-  for (const dep of ['format.js', 'highlight.js', 'markdown.js', 'app.js']) {
+  for (const dep of ['format.js', 'attachments.js', 'highlight.js', 'markdown.js', 'app.js']) {
     vm.runInContext(
       fs.readFileSync(path.join(__dirname, '..', 'public', dep), 'utf8'),
       sandbox,

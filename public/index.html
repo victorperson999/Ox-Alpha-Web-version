@@ -79,10 +79,33 @@
 
       <button class="jump-btn" id="jumpBtn" type="button" hidden>&#8595;&nbsp;Latest</button>
 
+      <div class="attach-tray" id="attachTray" hidden></div>
+
       <form class="composer" id="composer" autocomplete="off">
-        <textarea id="input" rows="1" placeholder="Message Ox Alpha&hellip;" autofocus></textarea>
+        <button class="attach" id="attachBtn" type="button" title="Attach an image or text file"
+          aria-label="Attach an image or text file">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+          </svg>
+        </button>
+        <textarea id="input" rows="1" placeholder="Message Ox Alpha&hellip; (paste a screenshot to attach it)" autofocus></textarea>
         <button id="send" type="submit" title="Send (Enter)" aria-label="Send">&#8593;</button>
       </form>
+
+      <input type="file" id="fileInput" multiple hidden
+        accept="image/png,image/jpeg,image/gif,image/webp,text/*,.md,.csv,.json,.yml,.yaml,.log,.sql,.sh,.ps1,.js,.ts,.py,.go,.rs,.java,.c,.h,.diff,.patch" />
+
+      <div class="drop-overlay" id="dropOverlay" hidden>
+        <div class="drop-card">
+          <span class="drop-icon" aria-hidden="true">
+            <svg class="icon" viewBox="0 0 24 24" focusable="false">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
+          </span>
+          <strong>Drop to attach</strong>
+          <span class="drop-sub">Images are sent to the model; text files are inlined</span>
+        </div>
+      </div>
 
       <p class="hint">Enter to send &middot; Shift+Enter for a newline &middot; Esc to stop</p>
     </div>
@@ -128,7 +151,11 @@
         <code>.env</code> for new messages.</li>
       <li><strong>Ask again</strong> re-sends your last question as a new turn. It adds
         to the conversation rather than replacing the previous answer.</li>
-      <li>Everything is stored locally: chats in your browser, sessions on disk.</li>
+      <li><strong>Attach</strong> by pasting a screenshot, dropping files, or using the
+        paperclip button. Images go to the model as images; text files are inlined
+        into your prompt.</li>
+      <li>Everything is stored locally: chats in your browser, sessions on disk.
+        Attachment thumbnails are saved, the full images are not.</li>
     </ul>
 
     <h4>Shortcuts</h4>
@@ -145,6 +172,7 @@
   </dialog>
 
   <script src="/format.js"></script>
+  <script src="/attachments.js"></script>
   <script src="/highlight.js"></script>
   <script src="/markdown.js"></script>
   <script src="/app.js"></script>
