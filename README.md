@@ -54,12 +54,21 @@ going (see [Backend selection](#backend-selection)).
   reply is kept, and the conversation stays resumable.
 - Turns are serialized per conversation, so two tabs on the same chat can't
   run two `claude --resume` processes over one transcript.
-- Replies render as Markdown — headings, lists, tables, blockquotes, and
-  fenced code with a language tag and a copy button.
+- Replies render as Markdown — headings, lists, tables, images, blockquotes,
+  and fenced code with syntax highlighting, a language tag, and a copy button.
 - Hover a sidebar chat to rename or delete it; deleting also drops the
   session server-side, so `sessions.json` stops growing forever.
 - A model dropdown overrides `.env` per message via `--model`.
-- Each reply shows its input/output token counts.
+- Each message carries a timestamp; each reply its input/output token counts.
+- Search reaches into message text, not just chat titles, and highlights the
+  matches when you open a chat.
+- A failed turn offers **Retry**; the newest reply offers **Copy** and
+  **Ask again**.
+- **Export chat** writes the open conversation out as a Markdown transcript.
+- The empty screen offers a few prompt starters.
+- **Attachments**: paste a screenshot, drop files, or use the paperclip.
+  Images go to the model as image content blocks; text files are inlined
+  into the prompt as fenced code. See [Attachments](#attachments).
 - Each browser tab gets its own conversation: the first turn pins a CLI session
   with `--session-id`, later turns continue it with `--resume`.
 - Binds to `127.0.0.1` only. Nothing leaves your machine except the model call
@@ -127,6 +136,16 @@ API — swap the base URL, token, and model slug.
 The optional `model` field on the request maps to `--model` for that turn
 only, overriding `ANTHROPIC_MODEL`. Slugs are charset-limited server-side.
 
+The optional `attachments` array takes up to six entries:
+
+```json
+{ "kind": "image", "name": "shot.png", "mediaType": "image/png", "data": "<base64>" }
+{ "kind": "text",  "name": "app.js",   "text": "const x = 1;" }
+```
+
+A message may be empty when at least one attachment is present — an
+uncaptioned screenshot is a perfectly good turn.
+
 `usage` is `{ input, output }` token counts as reported by the provider.
 There is deliberately **no cost figure**: the CLI computes one against
 Anthropic's price list, which is wrong for any other backend, and a
@@ -153,6 +172,57 @@ which kills the spawned CLI process.
 | `ANTHROPIC_API_KEY`    | (unset)                  | Blank it (`""`) when using an alternate backend   |
 | `ANTHROPIC_MODEL`      | (unset = CLI default)    | Model slug the CLI should use                     |
 | `OXCHAT_SESSIONS_FILE` | `./sessions.json`        | Where session ids are stored (tests override it)  |
+| `OXCHAT_MAX_BODY_BYTES`| `33554432` (32 MB)       | Request body cap (tests lower it to trip 413)     |
+
+## Attachments
+
+Ox Chat does **not** interpret your files. It reframes them so the model
+can:
+
+- **Images** become `image` content blocks in the request. That needs
+  structured input, so every turn is written to the CLI as one
+  `--input-format stream-json` line rather than as plain stdin.
+- **Text files** are inlined into your prompt as fenced blocks, tagged with
+  the language implied by the extension. The fence is lengthened when the
+  file contains one of its own, so a Markdown file cannot break out of it.
+
+There is deliberately no "save it to disk and let the agent read it" path.
+That would require putting your uploads inside the working directory the
+CLI operates in — the one holding `.env`.
+
+Images are downscaled in the browser to 1568px on the long edge before
+upload, because the model gains nothing past that. A screenshot stays PNG
+while PNG is reasonable, and falls back to JPEG only when it would not be.
+Cost scales with area, roughly `width * height / 750` tokens, and the
+staging chip shows the estimate before you send.
+
+| Limit                   | Value                          |
+| ----------------------- | ------------------------------ |
+| Attachments per message | 6                              |
+| Image size              | 5 MB decoded                   |
+| Image types             | PNG, JPEG, GIF, WebP           |
+| Text file size          | 256 KB                         |
+| Request body            | 32 MB                          |
+
+Chat history stores attachment **metadata and a thumbnail only** — never
+the base64 payload, which would exhaust `localStorage` within a handful of
+screenshots. Reopening an old chat shows what was attached; the CLI session
+still holds the real context.
+
+PDFs are not supported. Anthropic has `document` blocks, but whether an
+arbitrary backend passes them through is untested, so they are refused
+rather than half-working.
+
+## Shortcuts
+
+| Key                | Does                          |
+| ------------------ | ----------------------------- |
+| `Enter`            | Send                          |
+| `Shift`+`Enter`    | Newline                       |
+| `Esc`              | Stop a streaming reply        |
+| `Ctrl`/`Cmd`+`K`   | Jump to search                |
+| `Alt`+`N`          | New chat                      |
+| `Ctrl`/`Cmd`+`/`   | Shortcut reference            |
 
 Every value above can live in `.env` or in the environment. The four
 `ANTHROPIC_*` ones aren't used by Ox Chat itself — they're passed through to
@@ -170,17 +240,26 @@ reaches the model or the network, so it is free, offline, and fast: every
 and the streaming parser is fed recorded CLI output rather than a live
 process.
 
-| File                      | Covers                                          |
-| ------------------------- | ----------------------------------------------- |
-| `markdown.test.js`        | Rendering, and the injection safety it rests on  |
-| `stream-parser.test.js`   | `stream-json` → events, incl. what must not leak |
-| `config.test.js`          | `.env` parsing and precedence, token counts     |
-| `http.test.js`            | Routing, validation, static serving, traversal  |
-| `scroll.test.js`          | Streaming follow behaviour, under a DOM shim    |
+| File                      | Covers                                            |
+| ------------------------- | ------------------------------------------------- |
+| `markdown.test.js`        | Rendering, and the injection safety it rests on    |
+| `highlight.test.js`       | Tokenizing, and that it never emits raw input      |
+| `stream-parser.test.js`   | `stream-json` → events, incl. what must not leak   |
+| `format.test.js`          | Timestamps, search matching, Markdown export       |
+| `config.test.js`          | `.env` parsing and precedence, token counts        |
+| `http.test.js`            | Routing, validation, static serving, traversal     |
+| `attachments.test.js`     | What is accepted, and how content blocks are built |
+| `ui.test.js`              | Scroll-follow, shortcuts, starters, under a shim   |
 
-`scroll.test.js` runs the real `public/app.js` inside a `vm` context with a
-minimal DOM shim. That models `scrollTop`/`scrollHeight` arithmetic, not
-layout — it proves the follow logic, not the visual result.
+`ui.test.js` runs the real `public/*.js` inside a `vm` context with a minimal
+DOM shim. That models `scrollTop`/`scrollHeight` arithmetic, not layout — it
+proves the logic, not the visual result.
+
+Two files carry the load-bearing safety properties, and both are worth
+reading before changing them: `markdown.js` and `highlight.js` are the only
+places model output becomes HTML. Each escapes every character before
+emitting markup, and each can only produce tags and class names written
+literally in its own source — never anything derived from the input.
 
 ## Scope
 
@@ -198,7 +277,6 @@ don't do that.
 - Collapsible tool cards showing what `Bash`/`Read`/`Edit` actually ran,
   and rendered diffs for file edits
 - A collapsible panel for thinking blocks (currently filtered out)
-- Attachments — the CLI accepts images
 
 ## Why "Ox"?
 

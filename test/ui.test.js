@@ -1,5 +1,6 @@
 /*
- * Streaming scroll behaviour in public/app.js.
+ * UI behaviour in public/app.js: streaming scroll, shortcuts, starters,
+ * message actions, and failure recovery.
  *
  * app.js is written for a browser, so it runs here inside a vm context with a
  * DOM shim just rich enough to load it and fire scroll events. The shim models
@@ -89,11 +90,16 @@ const sandbox = {
     removeItem(k) { this._m.delete(k); },
   },
   navigator: { clipboard: { writeText: async () => {} } },
+  URL: { createObjectURL: () => 'blob:stub', revokeObjectURL() {} },
+  Blob: class { constructor(parts) { this.parts = parts; } },
   renderMarkdown: (t) => String(t),
   alert() {}, confirm() { return true; }, prompt() { return null; },
   document: {
+    body: makeEl('body'),
     getElementById: byId,
     createElement(tag) { const n = makeEl('new-' + tag); n.tagName = tag.toUpperCase(); return n; },
+    createTextNode: (text) => ({ nodeType: 3, nodeValue: text }),
+    createDocumentFragment: () => makeEl('fragment'),
     querySelectorAll: () => [],
     addEventListener(type, fn) {
       if (!listeners.has(this)) listeners.set(this, {});
@@ -123,11 +129,15 @@ const atBottom = (height, view = 500) => height - view;
 
 before(() => {
   vm.createContext(sandbox);
-  vm.runInContext(
-    fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8'),
-    sandbox,
-    { filename: 'app.js' }
-  );
+  // app.js expects its helpers to already be on the window, exactly as the
+  // script tags in index.html arrange.
+  for (const dep of ['format.js', 'attachments.js', 'highlight.js', 'markdown.js', 'app.js']) {
+    vm.runInContext(
+      fs.readFileSync(path.join(__dirname, '..', 'public', dep), 'utf8'),
+      sandbox,
+      { filename: dep }
+    );
+  }
   chat.children = [makeEl('m1'), makeEl('m2')];
 });
 
@@ -195,5 +205,70 @@ describe('the jump-to-latest button', () => {
     chat.children = [makeEl('m1')];
     setScroll({ height: 3000, top: 100 });
     assert.strictEqual(jump.hidden, false);
+  });
+});
+
+/* -------------------------------------------------- keyboard shortcuts */
+
+describe('keyboard shortcuts', () => {
+  const key = (init) => {
+    let prevented = false;
+    fire(sandbox.document, 'keydown', {
+      ctrlKey: false, metaKey: false, altKey: false, shiftKey: false,
+      target: byId('body'),
+      preventDefault() { prevented = true; },
+      ...init,
+    });
+    return prevented;
+  };
+
+  it('Ctrl+K focuses the search box', () => {
+    let focused = false;
+    byId('searchInput').focus = () => { focused = true; };
+    assert.strictEqual(key({ ctrlKey: true, key: 'k' }), true, 'must preventDefault');
+    assert.strictEqual(focused, true);
+  });
+
+  it('Cmd+K works too, for the mac muscle memory', () => {
+    let focused = false;
+    byId('searchInput').focus = () => { focused = true; };
+    key({ metaKey: true, key: 'K' });
+    assert.strictEqual(focused, true);
+  });
+
+  it('Alt+N starts a new chat', () => {
+    byId('chat').children = [makeEl('m')];
+    byId('topbarTitle').textContent = 'Something';
+    assert.strictEqual(key({ altKey: true, key: 'n' }), true);
+    assert.strictEqual(byId('topbarTitle').textContent, '', 'the open chat was cleared');
+  });
+
+  it('does not hijack a plain n, so typing still works', () => {
+    byId('topbarTitle').textContent = 'Kept';
+    assert.strictEqual(key({ key: 'n' }), false);
+    assert.strictEqual(byId('topbarTitle').textContent, 'Kept');
+  });
+
+  it('Ctrl+/ opens the shortcut reference', () => {
+    let opened = false;
+    byId('helpDlg').showModal = () => { opened = true; };
+    assert.strictEqual(key({ ctrlKey: true, key: '/' }), true);
+    assert.strictEqual(opened, true);
+  });
+});
+
+/* ------------------------------------------------------ prompt starters */
+
+describe('prompt starters', () => {
+  it('drops the suggestion into the composer instead of sending it', () => {
+    const input = byId('input');
+    input.value = '';
+    const starter = makeEl('starter');
+    starter.dataset.prompt = 'Summarise this project';
+    starter.closest = (sel) => (sel === 'button[data-prompt]' ? starter : null);
+
+    fire(byId('starters'), 'click', { target: starter });
+
+    assert.strictEqual(input.value, 'Summarise this project');
   });
 });
