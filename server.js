@@ -6,9 +6,10 @@
  *   PORT=8080 node server.js  -> custom port
  *
  * How it works: POST /api/chat spawns `claude -p` (headless mode), pipes the
- * user's message in over stdin, and returns the reply as JSON. Conversation
- * continuity uses native CLI sessions (--session-id on the first turn,
- * --resume afterwards), so each browser tab keeps its own context.
+ * user's message in over stdin, and streams the reply back token by token as
+ * Server-Sent Events. Conversation continuity uses native CLI sessions
+ * (--session-id on the first turn, --resume afterwards), so each browser tab
+ * keeps its own context.
  */
 'use strict';
 
@@ -19,9 +20,113 @@ const crypto = require('crypto');
 const { spawn, execFileSync } = require('child_process');
 
 const HOST = '127.0.0.1';
-const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+const HEARTBEAT_MS = 15 * 1000;
+
+/* ----------------------------------------------------------------- .env */
+
+// The backend variables the spawned CLI cares about. Listed explicitly so an
+// empty value can be treated as "make sure this is unset" (see buildClaudeEnv).
+const BACKEND_VARS = [
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_MODEL',
+];
+
+/**
+ * Minimal KEY=VALUE reader — enough for this project's config, still no
+ * dependency. Handles comments, blank lines, an optional `export ` prefix,
+ * and one layer of matching quotes.
+ */
+function loadDotEnv(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch {
+    return {}; // no .env is a perfectly normal setup
+  }
+
+  const out = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+
+    const key = line.slice(0, eq).replace(/^export\s+/, '').trim();
+    if (!key) continue;
+
+    let value = line.slice(eq + 1).trim();
+    const quoted =
+      value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.at(-1) === value[0];
+    if (quoted) value = value.slice(1, -1);
+
+    out[key] = value;
+  }
+  return out;
+}
+
+const dotEnv = loadDotEnv(path.join(__dirname, '.env'));
+
+/**
+ * Resolve one config value. The launching terminal wins over .env, so a
+ * one-off `$env:ANTHROPIC_MODEL = "..."; node server.js` still overrides the
+ * file for that run; .env wins over the built-in default.
+ */
+function conf(key, fallback) {
+  if (process.env[key]) return process.env[key];
+  if (dotEnv[key]) return dotEnv[key];
+  return fallback;
+}
+
+/** Where a value came from — printed in the banner so precedence is visible. */
+function sourceOf(key) {
+  if (dotEnv[key] === '') return '.env'; // an explicit unset outranks the terminal
+  if (process.env[key]) return 'environment';
+  if (dotEnv[key] !== undefined) return '.env';
+  return 'default';
+}
+
+/**
+ * The environment the spawned CLI actually gets, built once at startup so the
+ * banner and every turn agree on which backend is in play. This is what kills
+ * the launched-from-the-wrong-terminal failure mode: config now travels with
+ * the project instead of with the shell.
+ */
+function buildClaudeEnv() {
+  const env = { ...process.env };
+
+  for (const [key, value] of Object.entries(dotEnv)) {
+    // A bare "KEY=" is an explicit instruction to unset, so it outranks even a
+    // value inherited from the terminal — that is the entire point of writing
+    // it. The CLI prefers ANTHROPIC_API_KEY over ANTHROPIC_AUTH_TOKEN when both
+    // are present, so an inherited key would otherwise hijack the backend.
+    if (value === '') {
+      delete env[key];
+      continue;
+    }
+    if (process.env[key]) continue; // otherwise a real env var wins
+    env[key] = value;
+  }
+
+  // Same courtesy for a variable blanked in the launching terminal.
+  for (const key of BACKEND_VARS) {
+    if (env[key] === '') delete env[key];
+  }
+
+  // Strip markers that tell a nested Claude Code instance it is nested.
+  delete env.CLAUDECODE;
+  delete env.CLAUDE_CODE_ENTRYPOINT;
+  delete env.CLAUDE_CODE_SSE_PORT;
+
+  return env;
+}
+
+const CLAUDE_ENV = buildClaudeEnv();
+const PORT = Number(conf('PORT', 3000));
 
 /* ------------------------------------------------------------ claude CLI */
 
@@ -37,7 +142,7 @@ function resolveClaudePath() {
   }
 }
 
-const CLAUDE_PATH = process.env.CLAUDE_BIN || resolveClaudePath();
+const CLAUDE_PATH = conf('CLAUDE_BIN', '') || resolveClaudePath();
 
 // conversationId (ours, sent to the browser) -> claude session uuid.
 // Persisted to sessions.json so reopened chats keep their memory across
@@ -63,35 +168,95 @@ function saveSessions() {
 }
 
 /**
- * Spawn `claude -p`, write `message` to stdin, resolve with the reply text.
- * opts.mode 'new'    -> pin a fresh session with --session-id
- * opts.mode 'resume' -> continue an existing session with --resume
+ * Spawn `claude -p` in streaming mode and push events at the caller as they
+ * arrive. Resolves with { reply, sessionId, costUsd } once the CLI exits.
+ *
+ * opts.mode      'new'    -> pin a fresh session with --session-id
+ *                'resume' -> continue an existing session with --resume
+ * opts.sessionId the session uuid for whichever mode
+ * opts.signal    AbortSignal — aborting kills the child process
+ * opts.onInit    (sessionId) once the CLI confirms the session is live
+ * opts.onDelta   (text) for every chunk of the reply
+ * opts.onStatus  (tool) when the CLI starts a tool call, so pauses are visible
  */
-function runClaude(message, opts) {
+function streamClaude(message, opts) {
   return new Promise((resolve, reject) => {
     if (!CLAUDE_PATH) {
       return reject(new Error('claude CLI not found on PATH'));
     }
 
-    const args = ['-p', '--output-format', 'text'];
+    const args = [
+      '-p',
+      '--output-format', 'stream-json',
+      '--include-partial-messages',
+      // the CLI rejects stream-json under -p without this
+      '--verbose',
+    ];
     if (opts.mode === 'resume') args.push('--resume', opts.sessionId);
     else args.push('--session-id', opts.sessionId);
-
-    // Strip markers that tell a nested Claude Code instance it is nested.
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
-    delete env.CLAUDE_CODE_ENTRYPOINT;
-    delete env.CLAUDE_CODE_SSE_PORT;
+    // Overrides ANTHROPIC_MODEL for this turn only.
+    if (opts.model) args.push('--model', opts.model);
 
     const child = spawn(CLAUDE_PATH, args, {
-      env,
+      env: CLAUDE_ENV, // resolved once at startup from .env + this terminal
       cwd: __dirname,
       windowsHide: true,
     });
 
-    let stdout = '';
     let stderr = '';
-    child.stdout.on('data', (d) => (stdout += d));
+    let stdoutBuf = '';
+    let reply = '';
+    let result = null;
+    let sessionId = opts.sessionId;
+    let aborted = false;
+
+    /** Handle one JSONL line of the CLI's stream-json output. */
+    function consume(line) {
+      let ev;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        return; // non-JSON noise on stdout: ignore rather than derail the turn
+      }
+
+      if (ev.type === 'system' && ev.subtype === 'init') {
+        if (ev.session_id) {
+          sessionId = ev.session_id;
+          opts.onInit?.(sessionId);
+        }
+        return;
+      }
+
+      if (ev.type === 'result') {
+        result = ev;
+        return;
+      }
+
+      if (ev.type !== 'stream_event') return;
+      // Sub-agent chatter carries a parent id; only the top-level turn is the reply.
+      if (ev.parent_tool_use_id) return;
+
+      const e = ev.event;
+      if (e?.type === 'content_block_start' && e.content_block?.type === 'tool_use') {
+        opts.onStatus?.(e.content_block.name || 'tool');
+        return;
+      }
+      // Only text_delta is the answer — thinking_delta and input_json_delta are not.
+      if (e?.type === 'content_block_delta' && e.delta?.type === 'text_delta') {
+        reply += e.delta.text;
+        opts.onDelta?.(e.delta.text);
+      }
+    }
+
+    child.stdout.on('data', (chunk) => {
+      stdoutBuf += chunk;
+      let nl;
+      while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
+        const line = stdoutBuf.slice(0, nl).trim();
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        if (line) consume(line);
+      }
+    });
     child.stderr.on('data', (d) => (stderr += d));
 
     const timer = setTimeout(() => {
@@ -99,18 +264,41 @@ function runClaude(message, opts) {
       reject(new Error('claude took too long to reply (>5 min)'));
     }, REQUEST_TIMEOUT_MS);
 
-    child.on('error', (err) => {
+    const onAbort = () => {
+      aborted = true;
+      child.kill();
+    };
+    if (opts.signal) {
+      if (opts.signal.aborted) onAbort();
+      else opts.signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    function cleanup() {
       clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', onAbort);
+    }
+
+    child.on('error', (err) => {
+      cleanup();
       reject(err);
     });
 
     child.on('close', (code) => {
-      clearTimeout(timer);
-      if (code === 0 && stdout.trim()) {
-        resolve(stdout.trim());
-      } else {
-        reject(new Error(stderr.trim() || `claude exited with code ${code}`));
+      cleanup();
+      if (aborted) {
+        const err = new Error('stopped');
+        err.aborted = true;
+        return reject(err);
       }
+      if (result?.is_error) {
+        return reject(new Error(result.result || 'claude reported an error'));
+      }
+      // The result event carries the authoritative text; deltas are the preview.
+      const finalText = String(result?.result ?? reply).trim();
+      if (code === 0 && finalText) {
+        return resolve({ reply: finalText, sessionId, usage: result?.usage });
+      }
+      reject(new Error(stderr.trim() || `claude exited with code ${code}`));
     });
 
     // Prompt goes over stdin: immune to Windows quoting/newline issues.
@@ -122,15 +310,29 @@ function runClaude(message, opts) {
 /**
  * Handle one chat turn. Resumes the stored session when possible; if the
  * session is gone (CLI restart, expired transcript), falls back to a fresh
- * session automatically.
+ * session automatically — but only while nothing has been streamed yet, since
+ * restarting after the browser has painted text would duplicate the reply.
  */
-async function handleChatTurn(conversationId, message) {
+async function handleChatTurn(conversationId, message, hooks) {
+  // Persist on init rather than on success: a turn the user stops still has a
+  // session worth resuming.
+  const remember = (sessionId) => {
+    if (sessions[conversationId] !== sessionId) {
+      sessions[conversationId] = sessionId;
+      saveSessions();
+    }
+    hooks.onInit?.(sessionId);
+  };
+
   const existing = sessions[conversationId];
 
   if (existing) {
     try {
-      return await runClaude(message, { mode: 'resume', sessionId: existing });
+      return await streamClaude(message, {
+        ...hooks, onInit: remember, mode: 'resume', sessionId: existing,
+      });
     } catch (err) {
+      if (err.aborted || hooks.streamed()) throw err;
       console.error(`[ox-chat] resume failed (${conversationId}), starting fresh: ${err.message}`);
       delete sessions[conversationId];
       saveSessions();
@@ -139,10 +341,39 @@ async function handleChatTurn(conversationId, message) {
   }
 
   const sessionId = crypto.randomUUID();
-  const reply = await runClaude(message, { mode: 'new', sessionId });
-  sessions[conversationId] = sessionId;
-  saveSessions();
-  return reply;
+  return streamClaude(message, { ...hooks, onInit: remember, mode: 'new', sessionId });
+}
+
+/**
+ * Run one turn at a time per conversation. Two tabs (or an impatient
+ * double-send) pointed at the same session would otherwise have two
+ * `claude --resume` processes writing the same transcript.
+ */
+const turnQueues = new Map();
+
+function serialize(key, task) {
+  const prev = turnQueues.get(key) || Promise.resolve();
+  const run = prev.then(task, task); // run whether or not the previous turn failed
+  const tail = run.catch(() => {});
+  turnQueues.set(key, tail);
+  tail.then(() => {
+    if (turnQueues.get(key) === tail) turnQueues.delete(key);
+  });
+  return run;
+}
+
+/**
+ * Provider-reported token counts. Deliberately no cost figure: the CLI
+ * computes one with Anthropic's price list, which is wrong for any other
+ * backend, and a confidently wrong number is worse than none.
+ */
+function tokenSummary(usage) {
+  if (!usage) return null;
+  const input =
+    (usage.input_tokens || 0) +
+    (usage.cache_read_input_tokens || 0) +
+    (usage.cache_creation_input_tokens || 0);
+  return { input, output: usage.output_tokens || 0 };
 }
 
 /* ------------------------------------------------------------- HTTP glue */
@@ -165,14 +396,16 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
-function readBody(req, limit = 64 * 1024) {
+function readBody(req, limit = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on('data', (chunk) => {
       size += chunk.length;
       if (size > limit) {
-        reject(new Error('request body too large'));
+        const err = new Error('Message is too large.');
+        err.tooLarge = true;
+        reject(err);
         req.destroy();
         return;
       }
@@ -194,7 +427,8 @@ function serveStatic(req, res) {
   if (urlPath === '/') urlPath = '/index.html';
 
   const filePath = path.normalize(path.join(PUBLIC_DIR, urlPath));
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  // Trailing separator matters: without it a sibling `public-evil/` would pass.
+  if (filePath !== PUBLIC_DIR && !filePath.startsWith(PUBLIC_DIR + path.sep)) {
     res.writeHead(403).end();
     return;
   }
@@ -214,55 +448,161 @@ function serveStatic(req, res) {
   });
 }
 
+/** Stream one chat turn to the browser as Server-Sent Events. */
+async function handleChatRequest(req, res) {
+  let raw;
+  try {
+    raw = await readBody(req);
+  } catch (err) {
+    return sendJson(res, err.tooLarge ? 413 : 400, { error: err.message });
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    return sendJson(res, 400, { error: 'Invalid JSON body.' });
+  }
+
+  const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+  if (!message) {
+    return sendJson(res, 400, { error: 'Field "message" is required.' });
+  }
+
+  const conversationId =
+    typeof payload.conversationId === 'string' && payload.conversationId.length <= 64
+      ? payload.conversationId
+      : crypto.randomUUID();
+
+  // Charset-limited so a stray slug cannot turn into extra CLI arguments.
+  const model =
+    typeof payload.model === 'string' && /^[\w./:-]{1,64}$/.test(payload.model)
+      ? payload.model
+      : null;
+
+  console.log(`[ox-chat] conv=${conversationId.slice(0, 8)} prompt: ${message.slice(0, 80)}${message.length > 80 ? '…' : ''}`);
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+  });
+  res.socket?.setNoDelay(true);
+
+  const send = (event, data) => {
+    if (res.writableEnded) return;
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  // Comment frames keep the socket warm through a long tool call.
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write(': ping\n\n');
+  }, HEARTBEAT_MS);
+
+  // The Stop button aborts the fetch, which closes this socket: kill the CLI.
+  const ac = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) ac.abort();
+  });
+
+  let streamed = false;
+
+  try {
+    const out = await serialize(conversationId, () =>
+      handleChatTurn(conversationId, message, {
+        model,
+        signal: ac.signal,
+        onInit: () => send('session', { conversationId }),
+        onDelta: (text) => {
+          streamed = true;
+          send('delta', { text });
+        },
+        onStatus: (tool) => send('status', { tool }),
+        streamed: () => streamed,
+      }));
+    send('done', { reply: out.reply, conversationId, usage: tokenSummary(out.usage) });
+  } catch (err) {
+    if (!ac.signal.aborted) {
+      console.error(`[ox-chat] error: ${err.message}`);
+      send('error', { error: `Backend error: ${err.message}` });
+    }
+  } finally {
+    clearInterval(heartbeat);
+    res.end();
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/api/health') {
     return sendJson(res, 200, { ok: true, claude: CLAUDE_PATH });
   }
 
-  if (req.method === 'POST' && req.url === '/api/chat') {
-    let payload;
+  // Lets the UI show which backend and model it is actually talking to,
+  // instead of the browser having to guess from nothing.
+  if (req.method === 'GET' && req.url === '/api/config') {
+    return sendJson(res, 200, {
+      model: CLAUDE_ENV.ANTHROPIC_MODEL || null,
+      backend: CLAUDE_ENV.ANTHROPIC_BASE_URL || 'https://api.anthropic.com',
+    });
+  }
+
+  // Drop a conversation server-side so deleted chats stop accumulating in
+  // sessions.json forever.
+  if (req.method === 'DELETE' && req.url.startsWith('/api/chat/')) {
+    let id;
     try {
-      payload = JSON.parse(await readBody(req));
+      id = decodeURIComponent(req.url.slice('/api/chat/'.length));
     } catch {
-      return sendJson(res, 400, { error: 'Invalid JSON body.' });
+      return sendJson(res, 400, { error: 'Bad conversation id.' });
     }
-
-    const message = typeof payload.message === 'string' ? payload.message.trim() : '';
-    if (!message) {
-      return sendJson(res, 400, { error: 'Field "message" is required.' });
+    const existed = Object.prototype.hasOwnProperty.call(sessions, id);
+    if (existed) {
+      delete sessions[id];
+      saveSessions();
     }
+    return sendJson(res, 200, { deleted: existed });
+  }
 
-    const conversationId =
-      typeof payload.conversationId === 'string' && payload.conversationId.length <= 64
-        ? payload.conversationId
-        : crypto.randomUUID();
-
-    console.log(`[ox-chat] conv=${conversationId.slice(0, 8)} prompt: ${message.slice(0, 80)}${message.length > 80 ? '…' : ''}`);
-
-    try {
-      const reply = await handleChatTurn(conversationId, message);
-      return sendJson(res, 200, { reply, conversationId });
-    } catch (err) {
-      console.error(`[ox-chat] error: ${err.message}`);
-      return sendJson(res, 502, { error: `Backend error: ${err.message}` });
-    }
+  if (req.method === 'POST' && req.url === '/api/chat') {
+    return handleChatRequest(req, res);
   }
 
   if (req.method === 'GET') return serveStatic(req, res);
 
-  res.writeHead(405, { Allow: 'GET, POST' }).end();
+  res.writeHead(405, { Allow: 'GET, POST, DELETE' }).end();
 });
+
+/** Which variable carries the credential — never the credential itself. */
+function authLabel() {
+  if (CLAUDE_ENV.ANTHROPIC_API_KEY) return `ANTHROPIC_API_KEY set [${sourceOf('ANTHROPIC_API_KEY')}]`;
+  if (CLAUDE_ENV.ANTHROPIC_AUTH_TOKEN) return `ANTHROPIC_AUTH_TOKEN set [${sourceOf('ANTHROPIC_AUTH_TOKEN')}]`;
+  return 'your Claude Code login';
+}
 
 server.listen(PORT, HOST, () => {
   // Startup banner: the single source of truth for where messages will go.
-  // The spawned claude CLI inherits these env vars from THIS terminal.
-  const backend = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com (your normal Anthropic login)';
-  const model = process.env.ANTHROPIC_MODEL || '(CLI default)';
+  // Each line tags its source, so a stale terminal variable quietly winning
+  // over .env is visible rather than mysterious.
+  const keys = Object.keys(dotEnv);
+  const backend = CLAUDE_ENV.ANTHROPIC_BASE_URL;
+  const model = CLAUDE_ENV.ANTHROPIC_MODEL;
 
   console.log(`[ox-chat] listening on http://${HOST}:${PORT}`);
+  console.log(`[ox-chat] config:  ${keys.length ? `.env (${keys.join(', ')})` : 'no .env — this terminal only'}`);
   console.log(`[ox-chat] claude binary: ${CLAUDE_PATH || 'NOT FOUND — set CLAUDE_BIN'}`);
-  console.log(`[ox-chat] backend: ${backend}`);
-  console.log(`[ox-chat] model:   ${model}`);
+  console.log(`[ox-chat] backend: ${backend ? `${backend} [${sourceOf('ANTHROPIC_BASE_URL')}]` : 'https://api.anthropic.com (your normal Anthropic login)'}`);
+  console.log(`[ox-chat] model:   ${model ? `${model} [${sourceOf('ANTHROPIC_MODEL')}]` : '(CLI default)'}`);
+  console.log(`[ox-chat] auth:    ${authLabel()}`);
+
+  // A token with no base URL is almost always a half-finished setup: another
+  // provider's key aimed at Anthropic, which fails in a confusing way.
+  if (!backend && CLAUDE_ENV.ANTHROPIC_AUTH_TOKEN) {
+    console.warn('[ox-chat] WARNING: ANTHROPIC_AUTH_TOKEN is set but ANTHROPIC_BASE_URL is not, so that token goes to api.anthropic.com. If it belongs to another provider, set ANTHROPIC_BASE_URL too.');
+  }
+
+  if (backend && CLAUDE_ENV.ANTHROPIC_API_KEY) {
+    console.warn('[ox-chat] WARNING: ANTHROPIC_API_KEY is set alongside a custom base URL. The CLI prefers it over ANTHROPIC_AUTH_TOKEN, so your requests may not go where you think. Blank it with a bare "ANTHROPIC_API_KEY=" line in .env.');
+  }
 });
 
 server.on('error', (err) => {

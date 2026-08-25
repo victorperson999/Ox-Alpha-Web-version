@@ -51,6 +51,7 @@
       <div class="topbar">
         <button class="burger" id="burger" type="button" aria-label="Toggle sidebar">&#9776;</button>
         <span class="topbar-title" id="topbarTitle"></span>
+        <select class="model-select" id="modelSelect" aria-label="Model"></select>
       </div>
 
       <header class="hero" id="hero">
@@ -69,7 +70,7 @@
         <button id="send" type="submit" title="Send (Enter)" aria-label="Send">&#8593;</button>
       </form>
 
-      <p class="hint">Enter to send &middot; Shift+Enter for a newline &middot; a reply can take up to a minute</p>
+      <p class="hint">Enter to send &middot; Shift+Enter for a newline &middot; Esc to stop</p>
     </div>
   </div>
 
@@ -104,6 +105,12 @@
       <li><strong>New chat</strong> starts a fresh conversation with a clean context.</li>
       <li>Click any chat in the sidebar to reopen it with its memory intact.</li>
       <li><strong>Search</strong> filters your saved chats by title.</li>
+      <li>While a reply streams, the send button becomes <strong>stop</strong> &mdash;
+        or press <kbd>Esc</kbd>. Whatever arrived so far is kept.</li>
+      <li>Hover a chat in the sidebar to <strong>rename</strong> or <strong>delete</strong> it.
+        Deleting also drops the session on disk.</li>
+      <li>Hover a code block to copy it. The <strong>model</strong> dropdown overrides
+        <code>.env</code> for new messages.</li>
       <li>Everything is stored locally: chats in your browser, sessions on disk.</li>
     </ul>
     <div class="dlg-actions">
@@ -111,6 +118,7 @@
     </div>
   </dialog>
 
+  <script src="/markdown.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

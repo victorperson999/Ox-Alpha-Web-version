@@ -4,6 +4,7 @@ node_modules/
 # local secrets
 .env
 .env.*
+!.env.example
 
 # logs & OS noise
 *.log

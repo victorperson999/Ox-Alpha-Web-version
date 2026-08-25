@@ -17,11 +17,22 @@ node server.js
 
 Open **http://localhost:3000**
 
-On startup the server prints which backend and model it inherited:
+To point it at a non-default backend, copy `.env.example` to `.env` and edit
+it — no environment juggling required:
+
+```powershell
+copy .env.example .env
+node server.js
+```
+
+On startup the server prints its resolved config, tagging each value with
+where it came from:
 
 ```
-[ox-chat] backend: https://openrouter.ai/api
-[ox-chat] model:   stealth/ox-alpha
+[ox-chat] config:  .env (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL)
+[ox-chat] backend: https://openrouter.ai/api [.env]
+[ox-chat] model:   stealth/ox-alpha [.env]
+[ox-chat] auth:    ANTHROPIC_AUTH_TOKEN set [.env]
 ```
 
 Read that banner — it's the single source of truth for where your messages are
@@ -31,9 +42,21 @@ going (see [Backend selection](#backend-selection)).
 
 - Serves a static chat UI (`public/`) — welcome screen, message bubbles,
   auto-growing input bar, typing indicator.
-- `POST /api/chat` spawns `claude -p` in headless mode and pipes your message
-  to it over stdin. Auth comes from your existing Claude Code login — no API
-  key stored or handled by this app.
+- `POST /api/chat` spawns `claude -p` in headless mode, pipes your message to
+  it over stdin, and streams the reply back token by token over Server-Sent
+  Events. Auth comes from your existing Claude Code login — no API key stored
+  or handled by this app.
+- The send button becomes a **stop** button while a reply is streaming (or
+  press <kbd>Esc</kbd>). Stopping kills the CLI child process; the partial
+  reply is kept, and the conversation stays resumable.
+- Turns are serialized per conversation, so two tabs on the same chat can't
+  run two `claude --resume` processes over one transcript.
+- Replies render as Markdown — headings, lists, tables, blockquotes, and
+  fenced code with a language tag and a copy button.
+- Hover a sidebar chat to rename or delete it; deleting also drops the
+  session server-side, so `sessions.json` stops growing forever.
+- A model dropdown overrides `.env` per message via `--model`.
+- Each reply shows its input/output token counts.
 - Each browser tab gets its own conversation: the first turn pins a CLI session
   with `--session-id`, later turns continue it with `--resume`.
 - Binds to `127.0.0.1` only. Nothing leaves your machine except the model call
@@ -42,8 +65,18 @@ going (see [Backend selection](#backend-selection)).
 ## Backend selection
 
 Ox Chat never talks to a model directly — it spawns your locally installed
-`claude` CLI, and the spawned process **inherits its backend from the
-environment of the terminal that launched `node server.js`**.
+`claude` CLI and hands it an explicitly built environment, assembled at
+startup from `.env` plus the launching terminal.
+
+Precedence, highest first:
+
+1. A bare `KEY=` in `.env` — an explicit "make sure this is unset"
+2. A variable set in the terminal that launched the server
+3. A value in `.env`
+4. The built-in default
+
+So `.env` is the durable project config, and a terminal variable is a
+one-off override for a single run.
 
 ### Default: Anthropic
 
@@ -52,28 +85,59 @@ bills your normal Anthropic plan/API.
 
 ### Ox Alpha via OpenRouter (the namesake setup)
 
-Run these in the **same terminal**, then start the server:
+Put this in `.env` and just run `node server.js`:
 
-```powershell
-$env:ANTHROPIC_BASE_URL   = "https://openrouter.ai/api"   # no /v1 — the CLI appends /v1/messages itself
-$env:ANTHROPIC_AUTH_TOKEN = "sk-or-v1-your-key-here"      # your OpenRouter API key, sent as a bearer token
-$env:ANTHROPIC_API_KEY    = ""                            # blank explicitly so the CLI doesn't prefer it
-$env:ANTHROPIC_MODEL      = "stealth/ox-alpha"
-node server.js
+```ini
+ANTHROPIC_BASE_URL=https://openrouter.ai/api      # no /v1 — the CLI appends /v1/messages itself
+ANTHROPIC_AUTH_TOKEN=sk-or-v1-your-key-here       # your OpenRouter key, sent as a bearer token
+ANTHROPIC_MODEL=stealth/ox-alpha
+ANTHROPIC_API_KEY=                                # bare = unset; the CLI would otherwise prefer it
 ```
 
 The same pattern works for any endpoint that speaks the Anthropic Messages
 API — swap the base URL, token, and model slug.
 
-> **Warning — session-scoped config.** These variables live only in the
-> terminal session where you set them. Launching the server from a fresh
-> terminal silently falls back to your Anthropic login. The startup banner
-> tells you which backend you're actually on.
+> **All four lines matter.** A token without `ANTHROPIC_BASE_URL` gets sent
+> to Anthropic and fails; an `ANTHROPIC_API_KEY` that's set (even inherited
+> from your shell) outranks `ANTHROPIC_AUTH_TOKEN` and silently hijacks the
+> backend. The server warns about both cases at startup.
 
 > **Privacy note on stealth models.** Cloaked models like `stealth/ox-alpha`
 > are typically free or cheap because the (anonymous) lab behind them logs
 > prompts for evaluation. Don't route anything sensitive or work-related
 > through them.
+
+## Streaming API
+
+`POST /api/chat` takes `{ message, conversationId }` and responds with
+`text/event-stream`. Validation failures come back as plain JSON instead
+(`400`/`413`), so check the content type before parsing frames.
+
+| Event     | Payload                                     | Meaning                                |
+| --------- | ------------------------------------------- | -------------------------------------- |
+| `session` | `{ conversationId }`                        | Session is live — sent before any text |
+| `delta`   | `{ text }`                                  | A chunk of the reply                   |
+| `status`  | `{ tool }`                                  | The CLI started a tool call            |
+| `done`    | `{ reply, conversationId, usage }`          | Final authoritative text + tokens      |
+| `error`   | `{ error }`                                 | The turn failed                        |
+
+The optional `model` field on the request maps to `--model` for that turn
+only, overriding `ANTHROPIC_MODEL`. Slugs are charset-limited server-side.
+
+`usage` is `{ input, output }` token counts as reported by the provider.
+There is deliberately **no cost figure**: the CLI computes one against
+Anthropic's price list, which is wrong for any other backend, and a
+confidently wrong number is worse than none.
+
+Two more endpoints:
+
+| Endpoint                     | Purpose                                          |
+| ---------------------------- | ------------------------------------------------ |
+| `GET /api/config`            | Resolved backend + model, so the UI can show them |
+| `DELETE /api/chat/{id}`      | Forget one conversation server-side               |
+
+Aborting the request (the Stop button does exactly this) closes the socket,
+which kills the spawned CLI process.
 
 ## Config
 
@@ -86,9 +150,9 @@ API — swap the base URL, token, and model slug.
 | `ANTHROPIC_API_KEY`    | (unset)                  | Blank it (`""`) when using an alternate backend   |
 | `ANTHROPIC_MODEL`      | (unset = CLI default)    | Model slug the CLI should use                     |
 
-The four `ANTHROPIC_*` variables aren't read by Ox Chat's own code — they're
-inherited by the spawned CLI processes. They're documented here because they
-decide which model answers you.
+Every value above can live in `.env` or in the environment. The four
+`ANTHROPIC_*` ones aren't used by Ox Chat itself — they're passed through to
+the spawned CLI, and they decide which model answers you.
 
 ## Scope
 
@@ -97,15 +161,16 @@ to localhost and rides on the Claude Code installation of whoever runs it. It
 is not designed to be exposed to other users or to share one account's access —
 don't do that.
 
-## Ideas for v2
+## Ideas for v3
 
-- Stream tokens live (SSE + `--output-format stream-json`)
-- Render markdown in replies
-- Conversation sidebar backed by `~/.claude/projects`
-- Model picker (`--model`) — surface the backend/model choice in the UI
-  instead of the launching terminal's environment
-- Pass `ANTHROPIC_*` config explicitly into the spawn's `env` object, killing
-  the launched-from-the-wrong-terminal failure mode
+- Conversation history backed by `~/.claude/projects` instead of
+  `localStorage`, which a browser cache clear currently wipes
+- A per-chat working directory, so a conversation can operate on another
+  project instead of always running inside the ox-chat folder
+- Collapsible tool cards showing what `Bash`/`Read`/`Edit` actually ran,
+  and rendered diffs for file edits
+- A collapsible panel for thinking blocks (currently filtered out)
+- Attachments — the CLI accepts images
 
 ## Why "Ox"?
 
