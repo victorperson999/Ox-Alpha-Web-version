@@ -16,6 +16,8 @@ const els = {
   avatar: $('avatar'),
   hero: $('hero'),
   topbarTitle: $('topbarTitle'),
+  jumpBtn: $('jumpBtn'),
+  modelSelect: $('modelSelect'),
   chat: $('chat'),
   composer: $('composer'),
   input: $('input'),
@@ -26,11 +28,18 @@ const els = {
 
 const STORE_KEY = 'oxchat.chats.v1';
 const NAME_KEY = 'oxchat.name';
+const MODEL_KEY = 'oxchat.model';
+const MODEL_LIST_KEY = 'oxchat.models';
 
 let chats = loadJSON(STORE_KEY, {}); // id -> {id,title,conversationId,createdAt,updatedAt,messages}
 let currentChatId = null;
 let conversationId = null;
 let busy = false;
+let abort = null; // AbortController for the in-flight turn
+
+let defaultModel = null; // whatever .env resolved to, from /api/config
+let customModels = loadJSON(MODEL_LIST_KEY, []);
+let chosenModel = localStorage.getItem(MODEL_KEY) || ''; // '' = use the server default
 
 function loadJSON(key, fallback) {
   try {
@@ -41,11 +50,13 @@ function loadJSON(key, fallback) {
   }
 }
 
-function persist() {
+function saveJSON(key, value) {
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(chats));
-  } catch { /* private mode etc. — chat still works, history just won't save */ }
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch { /* private mode etc. — the app still works, it just won't remember */ }
 }
+
+const persist = () => saveJSON(STORE_KEY, chats);
 
 /* --------------------------------------------------------- sidebar */
 
@@ -66,14 +77,80 @@ function renderList() {
   }
 
   for (const c of items) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'chat-item' + (c.id === currentChatId ? ' active' : '');
-    btn.textContent = c.title;
-    btn.title = c.title;
-    btn.addEventListener('click', () => openChat(c.id));
-    els.chatList.appendChild(btn);
+    // A row, not a single button: it holds its own rename/delete controls, and
+    // a button cannot legally nest inside another button.
+    const row = document.createElement('div');
+    row.className = 'chat-item' + (c.id === currentChatId ? ' active' : '');
+
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'chat-open';
+    open.textContent = c.title;
+    open.title = c.title;
+    open.addEventListener('click', () => openChat(c.id));
+
+    const actions = document.createElement('div');
+    actions.className = 'chat-actions';
+
+    const rename = document.createElement('button');
+    rename.type = 'button';
+    rename.className = 'chat-act';
+    rename.innerHTML = '&#9998;';
+    rename.title = 'Rename';
+    rename.setAttribute('aria-label', `Rename "${c.title}"`);
+    rename.addEventListener('click', (e) => {
+      e.stopPropagation();
+      renameChat(c.id);
+    });
+
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'chat-act danger';
+    del.innerHTML = '&#10005;';
+    del.title = 'Delete';
+    del.setAttribute('aria-label', `Delete "${c.title}"`);
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteChat(c.id);
+    });
+
+    actions.append(rename, del);
+    row.append(open, actions);
+    els.chatList.appendChild(row);
   }
+}
+
+function renameChat(id) {
+  const c = chats[id];
+  if (!c) return;
+  const next = prompt('Rename chat', c.title);
+  if (next === null) return;
+  c.title = next.trim().slice(0, 80) || c.title;
+  c.updatedAt = Date.now();
+  persist();
+  if (id === currentChatId) els.topbarTitle.textContent = c.title;
+  renderList();
+}
+
+/** Forget a conversation on the server too, so sessions.json stops growing. */
+async function forgetSession(convId) {
+  if (!convId) return;
+  try {
+    await fetch(`/api/chat/${encodeURIComponent(convId)}`, { method: 'DELETE' });
+  } catch { /* the chat is gone from the UI either way */ }
+}
+
+async function deleteChat(id) {
+  const c = chats[id];
+  if (!c) return;
+  if (!confirm(`Delete "${c.title}"? This cannot be undone.`)) return;
+
+  const convId = c.conversationId;
+  delete chats[id];
+  persist();
+  if (id === currentChatId) newChat();
+  else renderList();
+  await forgetSession(convId);
 }
 
 function openChat(id) {
@@ -84,7 +161,13 @@ function openChat(id) {
 
   els.chat.innerHTML = '';
   for (const m of c.messages) {
-    addBubble(m.role === 'user' ? 'user' : 'assistant', m.text);
+    if (m.role === 'user') {
+      addBubble('user', m.text);
+    } else {
+      const bubble = addBubble('assistant', '');
+      renderAssistant(bubble, m.text, true);
+      if (m.usage) addMeta(bubble, m.usage);
+    }
   }
   els.hero.classList.add('gone');
   els.topbarTitle.textContent = c.title;
@@ -106,17 +189,95 @@ function newChat() {
 
 /* ------------------------------------------------------------ chat */
 
-function scrollToEnd() {
-  els.chat.scrollTo({ top: els.chat.scrollHeight, behavior: 'smooth' });
+// How close to the bottom still counts as "following along".
+const FOLLOW_SLACK_PX = 80;
+
+let autoFollow = true;
+let programmaticScrolls = 0;
+
+function nearBottom() {
+  const el = els.chat;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK_PX;
 }
+
+/** Jump to the newest message and resume following the stream. */
+function scrollToEnd(smooth = true) {
+  autoFollow = true;
+  programmaticScrolls++;
+  els.chat.scrollTo({ top: els.chat.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+  updateJumpButton(); // hide it now, rather than letting it linger the whole animation
+  // Smooth scrolling emits its own scroll events on the way down; ignore
+  // them, or the midpoint of our own animation reads as "user scrolled up".
+  setTimeout(() => {
+    programmaticScrolls = Math.max(0, programmaticScrolls - 1);
+    updateJumpButton();
+  }, 400);
+}
+
+/**
+ * Follow arriving tokens — but only while the reader is already at the
+ * bottom. Yanking them back down every frame while they have scrolled up to
+ * re-read something is worse than simply not following.
+ */
+function followStream() {
+  if (autoFollow) els.chat.scrollTop = els.chat.scrollHeight;
+}
+
+function updateJumpButton() {
+  els.jumpBtn.hidden = autoFollow || !els.chat.children.length;
+}
+
+els.chat.addEventListener('scroll', () => {
+  if (programmaticScrolls > 0) return;
+  autoFollow = nearBottom();
+  updateJumpButton();
+});
+
+els.jumpBtn.addEventListener('click', () => {
+  scrollToEnd();
+  els.input.focus();
+});
 
 function addBubble(kind, text) {
   const el = document.createElement('div');
   el.className = `msg ${kind}`;
-  el.textContent = text; // textContent keeps user/model text inert
+  el.textContent = text; // textContent keeps user text inert
   els.chat.appendChild(el);
   scrollToEnd();
   return el;
+}
+
+/**
+ * Model replies are the one place we build HTML from untrusted text.
+ * renderMarkdown escapes everything before emitting its own fixed tag set —
+ * see public/markdown.js.
+ */
+function renderAssistant(el, text, withCopyButtons) {
+  el.classList.add('md');
+  el.innerHTML = window.renderMarkdown(text);
+  if (withCopyButtons) addCopyButtons(el);
+}
+
+function addCopyButtons(root) {
+  for (const pre of root.querySelectorAll('pre')) {
+    if (pre.querySelector('.copy-btn')) continue;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    pre.appendChild(btn);
+  }
+}
+
+function addMeta(bubble, usage) {
+  if (!usage) return;
+  const m = document.createElement('div');
+  m.className = 'msg-meta';
+  // Tokens only: the CLI's cost figure uses Anthropic pricing and is wrong
+  // for any other backend.
+  m.textContent = `↑ ${usage.input.toLocaleString()} in · ↓ ${usage.output.toLocaleString()} out`;
+  bubble.insertAdjacentElement('afterend', m);
+  return m;
 }
 
 function addTyping() {
@@ -133,6 +294,54 @@ function autosize() {
   els.input.style.height = Math.min(els.input.scrollHeight, 180) + 'px';
 }
 
+/**
+ * Parse an SSE body into {event, data} objects as frames arrive.
+ * Frames are separated by a blank line; `:` lines are keep-alive comments.
+ */
+async function* sseFrames(body) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+
+    let split;
+    while ((split = buf.indexOf('\n\n')) !== -1) {
+      const frame = buf.slice(0, split);
+      buf = buf.slice(split + 2);
+
+      let event = 'message';
+      const data = [];
+      for (const line of frame.split('\n')) {
+        if (!line || line.startsWith(':')) continue;
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+      }
+      if (!data.length) continue;
+
+      try {
+        yield { event, data: JSON.parse(data.join('\n')) };
+      } catch { /* malformed frame — skip it rather than kill the stream */ }
+    }
+  }
+}
+
+function setBusy(on) {
+  busy = on;
+  // The send button doubles as the stop button, so it must stay enabled.
+  els.sendBtn.classList.toggle('is-stop', on);
+  els.sendBtn.innerHTML = on ? '&#9632;' : '&#8593;';
+  els.sendBtn.title = on ? 'Stop (Esc)' : 'Send (Enter)';
+  els.sendBtn.setAttribute('aria-label', on ? 'Stop generating' : 'Send');
+}
+
+function stop() {
+  abort?.abort();
+}
+
 async function send() {
   const text = els.input.value.trim();
   if (!text || busy) return;
@@ -142,37 +351,105 @@ async function send() {
   els.input.value = '';
   autosize();
 
-  busy = true;
-  els.sendBtn.disabled = true;
+  setBusy(true);
   const typing = addTyping();
+  let bubble = null;
+  let status = null;
+  let reply = '';
+  let usage = null;
+  let stopped = false;
+  let failed = null;
+
+  // Re-rendering markdown on every delta would be wasteful and jittery, so
+  // repaint at most once per animation frame.
+  let painting = false;
+  const paint = () => {
+    if (painting || !bubble) return;
+    painting = true;
+    requestAnimationFrame(() => {
+      painting = false;
+      if (!bubble) return;
+      renderAssistant(bubble, reply, false);
+      followStream();
+    });
+  };
+
+  abort = new AbortController();
+
+  const setStatus = (tool) => {
+    if (!status) {
+      status = document.createElement('div');
+      status.className = 'tool-status';
+    }
+    status.textContent = `⚙ running ${tool}…`;
+    els.chat.appendChild(status); // appendChild moves it back to the end
+    followStream();
+  };
 
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, conversationId }),
+      body: JSON.stringify({ message: text, conversationId, model: chosenModel || undefined }),
+      signal: abort.signal,
     });
-    const data = await res.json();
-    typing.remove();
 
-    if (data.error) {
-      addBubble('error', '⚠️ ' + data.error);
-    } else {
-      conversationId = data.conversationId;
-      addBubble('assistant', data.reply);
-      rememberTurn(text, data.reply);
+    // Validation failures come back as plain JSON, not a stream.
+    if (!res.ok || !res.headers.get('content-type')?.includes('text/event-stream')) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `Server returned ${res.status}`);
     }
-  } catch {
-    typing.remove();
-    addBubble('error', '⚠️ Could not reach the local server.');
+
+    for await (const { event, data } of sseFrames(res.body)) {
+      if (event === 'session') {
+        conversationId = data.conversationId;
+      } else if (event === 'delta') {
+        if (typing.isConnected) typing.remove();
+        if (!bubble) {
+          bubble = addBubble('assistant', '');
+          bubble.classList.add('streaming');
+        }
+        reply += data.text;
+        paint();
+      } else if (event === 'status') {
+        setStatus(data.tool);
+      } else if (event === 'error') {
+        failed = data.error;
+      } else if (event === 'done') {
+        // The server's final text is authoritative; deltas were the preview.
+        reply = data.reply ?? reply;
+        usage = data.usage || null;
+        if (!bubble) bubble = addBubble('assistant', '');
+      }
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') stopped = true;
+    else failed = err.message || 'Could not reach the local server.';
   }
 
-  busy = false;
-  els.sendBtn.disabled = false;
+  if (typing.isConnected) typing.remove();
+  status?.remove();
+
+  if (bubble) {
+    bubble.classList.remove('streaming');
+    renderAssistant(bubble, reply, true); // final paint, now with copy buttons
+    if (stopped) bubble.classList.add('stopped');
+    if (!reply) bubble.remove();
+    else if (usage) addMeta(bubble, usage);
+  }
+
+  // Keep whatever arrived: a stopped or half-failed turn is still history the
+  // CLI session remembers, so the transcript must match it.
+  if (reply) rememberTurn(text, reply, usage);
+  if (failed) addBubble('error', '⚠️ ' + failed);
+
+  abort = null;
+  setBusy(false);
+  scrollToEnd();
   els.input.focus();
 }
 
-function rememberTurn(userText, replyText) {
+function rememberTurn(userText, replyText, usage) {
   if (!currentChatId) {
     currentChatId = crypto.randomUUID();
     chats[currentChatId] = {
@@ -186,11 +463,99 @@ function rememberTurn(userText, replyText) {
   }
   const c = chats[currentChatId];
   c.conversationId = conversationId;
-  c.messages.push({ role: 'user', text: userText }, { role: 'assistant', text: replyText });
+  c.messages.push(
+    { role: 'user', text: userText },
+    { role: 'assistant', text: replyText, usage: usage || undefined }
+  );
   c.updatedAt = Date.now();
   persist();
   els.topbarTitle.textContent = c.title;
   renderList();
+}
+
+/* ------------------------------------------------------ copy buttons */
+
+els.chat.addEventListener('click', async (e) => {
+  const btn = e.target.closest('.copy-btn');
+  if (!btn) return;
+  const code = btn.closest('pre')?.querySelector('code');
+  if (!code) return;
+
+  const done = (label) => {
+    btn.textContent = label;
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+  };
+  try {
+    await navigator.clipboard.writeText(code.textContent);
+    done('Copied');
+  } catch {
+    done('Failed');
+  }
+});
+
+/* ------------------------------------------------------ model picker */
+
+function renderModelOptions() {
+  const sel = els.modelSelect;
+  sel.innerHTML = '';
+
+  const def = document.createElement('option');
+  def.value = '';
+  def.textContent = defaultModel ? `Default (${defaultModel})` : 'Default (from .env)';
+  sel.appendChild(def);
+
+  for (const m of customModels) {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m;
+    sel.appendChild(opt);
+  }
+
+  const add = document.createElement('option');
+  add.value = '__add__';
+  add.textContent = 'Add model…';
+  sel.appendChild(add);
+
+  // A model removed from the list falls back to the default.
+  sel.value = customModels.includes(chosenModel) ? chosenModel : '';
+  if (sel.value === '' && chosenModel) {
+    chosenModel = '';
+    localStorage.removeItem(MODEL_KEY);
+  }
+}
+
+els.modelSelect.addEventListener('change', () => {
+  const value = els.modelSelect.value;
+
+  if (value === '__add__') {
+    const slug = (prompt('Model slug to add (e.g. stealth/ox-alpha)') || '').trim();
+    // Same charset the server accepts, so the UI can't offer a slug it rejects.
+    if (slug && /^[\w./:-]{1,64}$/.test(slug)) {
+      if (!customModels.includes(slug)) {
+        customModels.push(slug);
+        saveJSON(MODEL_LIST_KEY, customModels);
+      }
+      chosenModel = slug;
+      localStorage.setItem(MODEL_KEY, slug);
+    } else if (slug) {
+      alert('That does not look like a model slug. Letters, digits, . _ - / : only.');
+    }
+    renderModelOptions();
+    return;
+  }
+
+  chosenModel = value;
+  if (value) localStorage.setItem(MODEL_KEY, value);
+  else localStorage.removeItem(MODEL_KEY);
+});
+
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/config');
+    const cfg = await res.json();
+    defaultModel = cfg.model || null;
+  } catch { /* the picker still works, it just won't name the default */ }
+  renderModelOptions();
 }
 
 /* ---------------------------------------------------- account menu */
@@ -210,10 +575,12 @@ document.addEventListener('click', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') setMenuOpen(false);
+  if (e.key !== 'Escape') return;
+  setMenuOpen(false);
+  if (busy) stop();
 });
 
-els.accountMenu.addEventListener('click', (e) => {
+els.accountMenu.addEventListener('click', async (e) => {
   const btn = e.target.closest('button[data-action]');
   if (!btn) return;
   setMenuOpen(false);
@@ -229,18 +596,16 @@ els.accountMenu.addEventListener('click', (e) => {
     case 'help':
       $('helpDlg').showModal();
       break;
-    case 'clear':
-      if (confirm('Delete all saved chats? This cannot be undone.')) {
-        chats = {};
-        currentChatId = null;
-        conversationId = null;
-        els.chat.innerHTML = '';
-        els.hero.classList.remove('gone');
-        els.topbarTitle.textContent = '';
-        persist();
-        renderList();
-      }
+    case 'clear': {
+      if (!confirm('Delete all saved chats? This cannot be undone.')) break;
+      const ids = Object.values(chats).map((c) => c.conversationId).filter(Boolean);
+      chats = {};
+      persist();
+      newChat();
+      // Drop the server-side sessions too, or sessions.json keeps them forever.
+      await Promise.all(ids.map(forgetSession));
       break;
+    }
   }
 });
 
@@ -288,7 +653,10 @@ els.scrim.addEventListener('click', closeMobileNav);
 
 els.composer.addEventListener('submit', (e) => {
   e.preventDefault();
-  send();
+  // Enter never reaches here (the textarea handles it), so a submit while
+  // busy is always a deliberate click on the stop button.
+  if (busy) stop();
+  else send();
 });
 
 els.input.addEventListener('keydown', (e) => {
@@ -304,4 +672,5 @@ els.newChatBtn.addEventListener('click', newChat);
 
 applyName();
 renderList();
+loadConfig();
 els.input.focus();
