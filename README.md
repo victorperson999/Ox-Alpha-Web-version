@@ -8,6 +8,13 @@ pointed at — your normal Anthropic login by default, or any Anthropic-compatib
 endpoint (like OpenRouter's stealth **Ox Alpha**, its namesake) via environment
 variables.
 
+![Ox Chat in use: a pasted screenshot attached to a message, the model describing it back, with timestamps, token counts and per-message actions](docs/oxchatexample.png)
+
+<sub>Above: a screenshot pasted straight into the composer, read back by the model.
+Below: the welcome screen.</sub>
+
+![The Ox Chat welcome screen: chat sidebar, prompt starters, model picker, and the composer](docs/oxchatui.png)
+
 ## Run
 
 ```powershell
