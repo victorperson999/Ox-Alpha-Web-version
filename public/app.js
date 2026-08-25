@@ -16,6 +16,7 @@ const els = {
   avatar: $('avatar'),
   hero: $('hero'),
   topbarTitle: $('topbarTitle'),
+  jumpBtn: $('jumpBtn'),
   modelSelect: $('modelSelect'),
   chat: $('chat'),
   composer: $('composer'),
@@ -188,14 +189,54 @@ function newChat() {
 
 /* ------------------------------------------------------------ chat */
 
-function scrollToEnd() {
-  els.chat.scrollTo({ top: els.chat.scrollHeight, behavior: 'smooth' });
+// How close to the bottom still counts as "following along".
+const FOLLOW_SLACK_PX = 80;
+
+let autoFollow = true;
+let programmaticScrolls = 0;
+
+function nearBottom() {
+  const el = els.chat;
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK_PX;
 }
 
-// While tokens stream in, smooth scrolling fights the arriving text.
-function stickToEnd() {
-  els.chat.scrollTop = els.chat.scrollHeight;
+/** Jump to the newest message and resume following the stream. */
+function scrollToEnd(smooth = true) {
+  autoFollow = true;
+  programmaticScrolls++;
+  els.chat.scrollTo({ top: els.chat.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+  updateJumpButton(); // hide it now, rather than letting it linger the whole animation
+  // Smooth scrolling emits its own scroll events on the way down; ignore
+  // them, or the midpoint of our own animation reads as "user scrolled up".
+  setTimeout(() => {
+    programmaticScrolls = Math.max(0, programmaticScrolls - 1);
+    updateJumpButton();
+  }, 400);
 }
+
+/**
+ * Follow arriving tokens — but only while the reader is already at the
+ * bottom. Yanking them back down every frame while they have scrolled up to
+ * re-read something is worse than simply not following.
+ */
+function followStream() {
+  if (autoFollow) els.chat.scrollTop = els.chat.scrollHeight;
+}
+
+function updateJumpButton() {
+  els.jumpBtn.hidden = autoFollow || !els.chat.children.length;
+}
+
+els.chat.addEventListener('scroll', () => {
+  if (programmaticScrolls > 0) return;
+  autoFollow = nearBottom();
+  updateJumpButton();
+});
+
+els.jumpBtn.addEventListener('click', () => {
+  scrollToEnd();
+  els.input.focus();
+});
 
 function addBubble(kind, text) {
   const el = document.createElement('div');
@@ -329,7 +370,7 @@ async function send() {
       painting = false;
       if (!bubble) return;
       renderAssistant(bubble, reply, false);
-      stickToEnd();
+      followStream();
     });
   };
 
@@ -342,7 +383,7 @@ async function send() {
     }
     status.textContent = `⚙ running ${tool}…`;
     els.chat.appendChild(status); // appendChild moves it back to the end
-    stickToEnd();
+    followStream();
   };
 
   try {

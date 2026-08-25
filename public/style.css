@@ -278,6 +278,7 @@ body {
 /* -------------------------------------------------------- main column */
 
 .main {
+  position: relative; /* anchors the floating jump-to-latest button */
   flex: 1;
   min-width: 0;
   display: flex;
@@ -757,3 +758,31 @@ body {
 }
 
 .model-select:hover { color: var(--text); }
+
+/* Offered only once you have scrolled away from a live reply. */
+.jump-btn {
+  position: absolute;
+  left: 50%;
+  bottom: 104px;
+  transform: translateX(-50%);
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-raised);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  z-index: 3;
+}
+
+.jump-btn:hover { border-color: var(--accent); }
+
+/* Images in rendered replies. */
+.msg.md img {
+  display: block;
+  max-width: 100%;
+  margin: 6px 0;
+  border-radius: 8px;
+}

@@ -76,17 +76,17 @@ const dotEnv = loadDotEnv(path.join(__dirname, '.env'));
  * one-off `$env:ANTHROPIC_MODEL = "..."; node server.js` still overrides the
  * file for that run; .env wins over the built-in default.
  */
-function conf(key, fallback) {
-  if (process.env[key]) return process.env[key];
-  if (dotEnv[key]) return dotEnv[key];
+function conf(key, fallback, env = process.env, file = dotEnv) {
+  if (env[key]) return env[key];
+  if (file[key]) return file[key];
   return fallback;
 }
 
 /** Where a value came from — printed in the banner so precedence is visible. */
-function sourceOf(key) {
-  if (dotEnv[key] === '') return '.env'; // an explicit unset outranks the terminal
-  if (process.env[key]) return 'environment';
-  if (dotEnv[key] !== undefined) return '.env';
+function sourceOf(key, env = process.env, file = dotEnv) {
+  if (file[key] === '') return '.env'; // an explicit unset outranks the terminal
+  if (env[key]) return 'environment';
+  if (file[key] !== undefined) return '.env';
   return 'default';
 }
 
@@ -96,10 +96,10 @@ function sourceOf(key) {
  * the launched-from-the-wrong-terminal failure mode: config now travels with
  * the project instead of with the shell.
  */
-function buildClaudeEnv() {
-  const env = { ...process.env };
+function buildClaudeEnv(processEnv = process.env, fileEnv = dotEnv) {
+  const env = { ...processEnv };
 
-  for (const [key, value] of Object.entries(dotEnv)) {
+  for (const [key, value] of Object.entries(fileEnv)) {
     // A bare "KEY=" is an explicit instruction to unset, so it outranks even a
     // value inherited from the terminal — that is the entire point of writing
     // it. The CLI prefers ANTHROPIC_API_KEY over ANTHROPIC_AUTH_TOKEN when both
@@ -108,7 +108,7 @@ function buildClaudeEnv() {
       delete env[key];
       continue;
     }
-    if (process.env[key]) continue; // otherwise a real env var wins
+    if (processEnv[key]) continue; // otherwise a real env var wins
     env[key] = value;
   }
 
@@ -147,7 +147,8 @@ const CLAUDE_PATH = conf('CLAUDE_BIN', '') || resolveClaudePath();
 // conversationId (ours, sent to the browser) -> claude session uuid.
 // Persisted to sessions.json so reopened chats keep their memory across
 // server restarts.
-const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
+// Overridable so tests (and a second instance) get their own store.
+const SESSIONS_FILE = conf('OXCHAT_SESSIONS_FILE', path.join(__dirname, 'sessions.json'));
 
 function loadSessions() {
   try {
@@ -165,6 +166,69 @@ function saveSessions() {
   } catch (err) {
     console.error(`[ox-chat] could not save sessions: ${err.message}`);
   }
+}
+
+/**
+ * Turn the CLI's stream-json output into callbacks. Kept separate from
+ * process management so it can be exercised against recorded CLI output
+ * without spawning anything.
+ *
+ * handlers.onInit(sessionId) / onDelta(text) / onStatus(toolName)
+ */
+function createStreamParser(handlers = {}) {
+  let buffer = '';
+  const state = { reply: '', result: null, sessionId: null };
+
+  function consume(line) {
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      return; // non-JSON noise on stdout: ignore rather than derail the turn
+    }
+
+    if (ev.type === 'system' && ev.subtype === 'init') {
+      if (ev.session_id) {
+        state.sessionId = ev.session_id;
+        handlers.onInit?.(ev.session_id);
+      }
+      return;
+    }
+
+    if (ev.type === 'result') {
+      state.result = ev;
+      return;
+    }
+
+    if (ev.type !== 'stream_event') return;
+    // Sub-agent chatter carries a parent id; only the top-level turn is the reply.
+    if (ev.parent_tool_use_id) return;
+
+    const e = ev.event;
+    if (e?.type === 'content_block_start' && e.content_block?.type === 'tool_use') {
+      handlers.onStatus?.(e.content_block.name || 'tool');
+      return;
+    }
+    // Only text_delta is the answer — thinking_delta and input_json_delta are not.
+    if (e?.type === 'content_block_delta' && e.delta?.type === 'text_delta') {
+      state.reply += e.delta.text;
+      handlers.onDelta?.(e.delta.text);
+    }
+  }
+
+  return {
+    /** Feed raw stdout; complete lines are parsed, partials are buffered. */
+    push(chunk) {
+      buffer += chunk;
+      let nl;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (line) consume(line);
+      }
+    },
+    state,
+  };
 }
 
 /**
@@ -204,59 +268,19 @@ function streamClaude(message, opts) {
     });
 
     let stderr = '';
-    let stdoutBuf = '';
-    let reply = '';
-    let result = null;
     let sessionId = opts.sessionId;
     let aborted = false;
 
-    /** Handle one JSONL line of the CLI's stream-json output. */
-    function consume(line) {
-      let ev;
-      try {
-        ev = JSON.parse(line);
-      } catch {
-        return; // non-JSON noise on stdout: ignore rather than derail the turn
-      }
-
-      if (ev.type === 'system' && ev.subtype === 'init') {
-        if (ev.session_id) {
-          sessionId = ev.session_id;
-          opts.onInit?.(sessionId);
-        }
-        return;
-      }
-
-      if (ev.type === 'result') {
-        result = ev;
-        return;
-      }
-
-      if (ev.type !== 'stream_event') return;
-      // Sub-agent chatter carries a parent id; only the top-level turn is the reply.
-      if (ev.parent_tool_use_id) return;
-
-      const e = ev.event;
-      if (e?.type === 'content_block_start' && e.content_block?.type === 'tool_use') {
-        opts.onStatus?.(e.content_block.name || 'tool');
-        return;
-      }
-      // Only text_delta is the answer — thinking_delta and input_json_delta are not.
-      if (e?.type === 'content_block_delta' && e.delta?.type === 'text_delta') {
-        reply += e.delta.text;
-        opts.onDelta?.(e.delta.text);
-      }
-    }
-
-    child.stdout.on('data', (chunk) => {
-      stdoutBuf += chunk;
-      let nl;
-      while ((nl = stdoutBuf.indexOf('\n')) !== -1) {
-        const line = stdoutBuf.slice(0, nl).trim();
-        stdoutBuf = stdoutBuf.slice(nl + 1);
-        if (line) consume(line);
-      }
+    const parser = createStreamParser({
+      onInit: (id) => {
+        sessionId = id;
+        opts.onInit?.(id);
+      },
+      onDelta: (t) => opts.onDelta?.(t),
+      onStatus: (t) => opts.onStatus?.(t),
     });
+
+    child.stdout.on('data', (chunk) => parser.push(String(chunk)));
     child.stderr.on('data', (d) => (stderr += d));
 
     const timer = setTimeout(() => {
@@ -290,6 +314,7 @@ function streamClaude(message, opts) {
         err.aborted = true;
         return reject(err);
       }
+      const { reply, result } = parser.state;
       if (result?.is_error) {
         return reject(new Error(result.result || 'claude reported an error'));
       }
@@ -405,8 +430,11 @@ function readBody(req, limit = 1024 * 1024) {
       if (size > limit) {
         const err = new Error('Message is too large.');
         err.tooLarge = true;
+        // Drain rather than destroy: tearing the socket down here would race
+        // the 413 and the client would see a connection reset instead.
+        req.removeAllListeners('data');
+        req.resume();
         reject(err);
-        req.destroy();
         return;
       }
       chunks.push(chunk);
@@ -579,7 +607,10 @@ function authLabel() {
   return 'your Claude Code login';
 }
 
-server.listen(PORT, HOST, () => {
+// Required as a module (by the tests) this file only exports; it starts
+// listening solely when run directly.
+if (require.main === module) {
+  server.listen(PORT, HOST, () => {
   // Startup banner: the single source of truth for where messages will go.
   // Each line tags its source, so a stale terminal variable quietly winning
   // over .env is visible rather than mysterious.
@@ -603,13 +634,26 @@ server.listen(PORT, HOST, () => {
   if (backend && CLAUDE_ENV.ANTHROPIC_API_KEY) {
     console.warn('[ox-chat] WARNING: ANTHROPIC_API_KEY is set alongside a custom base URL. The CLI prefers it over ANTHROPIC_AUTH_TOKEN, so your requests may not go where you think. Blank it with a bare "ANTHROPIC_API_KEY=" line in .env.');
   }
-});
+  });
 
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`[ox-chat] Port ${PORT} is busy. Start with another:  PORT=3001 node server.js`);
-  } else {
-    throw err;
-  }
-  process.exit(1);
-});
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[ox-chat] Port ${PORT} is busy. Start with another:  PORT=3001 node server.js`);
+    } else {
+      throw err;
+    }
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  server,
+  createStreamParser,
+  loadDotEnv,
+  buildClaudeEnv,
+  tokenSummary,
+  conf,
+  sourceOf,
+};
+
+

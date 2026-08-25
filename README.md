@@ -12,8 +12,11 @@ variables.
 
 ```powershell
 cd path\to\ox-chat   # wherever you cloned this repo
-node server.js
+npm start             # or: node server.js
 ```
+
+There is nothing to install — `package.json` has no dependencies, only
+scripts. Use `npm run dev` to restart automatically on file changes.
 
 Open **http://localhost:3000**
 
@@ -149,10 +152,35 @@ which kills the spawned CLI process.
 | `ANTHROPIC_AUTH_TOKEN` | (unset)                  | Bearer token for that backend                     |
 | `ANTHROPIC_API_KEY`    | (unset)                  | Blank it (`""`) when using an alternate backend   |
 | `ANTHROPIC_MODEL`      | (unset = CLI default)    | Model slug the CLI should use                     |
+| `OXCHAT_SESSIONS_FILE` | `./sessions.json`        | Where session ids are stored (tests override it)  |
 
 Every value above can live in `.env` or in the environment. The four
 `ANTHROPIC_*` ones aren't used by Ox Chat itself — they're passed through to
 the spawned CLI, and they decide which model answers you.
+
+## Tests
+
+```powershell
+npm test
+```
+
+Node's built-in runner, still zero dependencies. Nothing in the suite
+reaches the model or the network, so it is free, offline, and fast: every
+`/api/chat` case is one the server rejects *before* it would spawn the CLI,
+and the streaming parser is fed recorded CLI output rather than a live
+process.
+
+| File                      | Covers                                          |
+| ------------------------- | ----------------------------------------------- |
+| `markdown.test.js`        | Rendering, and the injection safety it rests on  |
+| `stream-parser.test.js`   | `stream-json` → events, incl. what must not leak |
+| `config.test.js`          | `.env` parsing and precedence, token counts     |
+| `http.test.js`            | Routing, validation, static serving, traversal  |
+| `scroll.test.js`          | Streaming follow behaviour, under a DOM shim    |
+
+`scroll.test.js` runs the real `public/app.js` inside a `vm` context with a
+minimal DOM shim. That models `scrollTop`/`scrollHeight` arithmetic, not
+layout — it proves the follow logic, not the visual result.
 
 ## Scope
 
